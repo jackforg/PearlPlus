@@ -36,6 +36,9 @@ public class PearlPlusConfig {
         public boolean enabled = true;
         public int readyWindowSeconds = 120;
         public int bindCodeExpiryMinutes = 10;
+        public boolean listenInMainChannel = true;
+        public String dedicatedDiscordChannelId;
+        public String dedicatedDiscordRoleId;
         public final Map<String, DiscordBinding> discordBindings = new LinkedHashMap<>();
         public final Map<String, TrustedDiscordBinding> trustedDiscordBindings = new LinkedHashMap<>();
     }

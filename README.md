@@ -65,6 +65,9 @@ pearlplus droppearlafterload <on/off>
 
 ```bash
 pearlplus offlineload <on/off>
+pearlplus offlineload channel <channelId|none>
+pearlplus offlineload role <roleId|none>
+pearlplus offlineload mainchannel <on/off>
 pearlplus discordbindings list
 pearlplus discordbindings remove <playerName>
 pearlplus discordbindings clear
@@ -101,6 +104,34 @@ Additional Discord commands:
 `pp offline status` shows whether a staged offline load is pathing or armed.
 
 `pp offline cancel` cancels your staged offline load.
+
+### Dedicated Crew Discord Channel
+
+PearlPlus can listen in its own Discord channel instead of Zenith's main command channel. This is useful when you want crew members to use only offline pearl commands without getting access to broader Zenith Discord commands.
+
+Recommended setup:
+
+1. Keep your normal Zenith control channel private to staff
+2. Create a separate Discord channel such as `#pearl-loads`
+3. Set that channel ID in PearlPlus with:
+
+```bash
+pp offlineload channel <channelId>
+```
+
+4. Optionally require a dedicated crew role for that channel:
+
+```bash
+pp offlineload role <roleId>
+```
+
+5. If you want PearlPlus offline commands to stay out of Zenith's main command channel entirely:
+
+```bash
+pp offlineload mainchannel off
+```
+
+Crew can then use commands like `.pp offline load` in the dedicated PearlPlus channel, while Zenith's normal bot commands remain limited to your main control channel.
 
 ### Trusted Discord Regulars
 

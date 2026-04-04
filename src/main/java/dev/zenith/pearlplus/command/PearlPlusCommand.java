@@ -47,7 +47,7 @@ public class PearlPlusCommand extends Command {
                 "autodefault <on/off>",
                 "whitelist <on/off / add / clear / list / remove>",
                 "droppearlafterload <on/off>",
-                "offlineload <on/off>",
+                "offlineload <on/off / channel <channelId|none> / role <roleId|none> / mainchannel <on/off>>",
                 "discordbindings <list / remove <playerName> / clear>",
                 "discordtrusted <add <playerName> <discordUserIdOrUsername> / list / remove <playerName> / clear>"
             )
@@ -345,7 +345,38 @@ public class PearlPlusCommand extends Command {
                     MODULE.get(OfflineLoadModule.class).syncEnabledFromConfig();
                     c.getSource().getEmbed().title("Offline load " + toggleStrCaps(enabled));
                     return 0;
-                })));
+                }))
+                .then(literal("channel")
+                        .then(argument("channelId", wordWithChars()).executes(c -> {
+                            String channelId = getString(c, "channelId");
+                            PLUGIN_CONFIG.offlineLoad.dedicatedDiscordChannelId =
+                                    "none".equalsIgnoreCase(channelId) ? null : channelId;
+                            c.getSource().getEmbed().title(
+                                    PLUGIN_CONFIG.offlineLoad.dedicatedDiscordChannelId == null
+                                            ? "Offline load dedicated channel cleared"
+                                            : "Offline load dedicated channel set to " + PLUGIN_CONFIG.offlineLoad.dedicatedDiscordChannelId
+                            );
+                            return 0;
+                        })))
+                .then(literal("role")
+                        .then(argument("roleId", wordWithChars()).executes(c -> {
+                            String roleId = getString(c, "roleId");
+                            PLUGIN_CONFIG.offlineLoad.dedicatedDiscordRoleId =
+                                    "none".equalsIgnoreCase(roleId) ? null : roleId;
+                            c.getSource().getEmbed().title(
+                                    PLUGIN_CONFIG.offlineLoad.dedicatedDiscordRoleId == null
+                                            ? "Offline load dedicated role cleared"
+                                            : "Offline load dedicated role set to " + PLUGIN_CONFIG.offlineLoad.dedicatedDiscordRoleId
+                            );
+                            return 0;
+                        })))
+                .then(literal("mainchannel")
+                        .then(argument("toggle", toggle()).executes(c -> {
+                            boolean enabled = getToggle(c, "toggle");
+                            PLUGIN_CONFIG.offlineLoad.listenInMainChannel = enabled;
+                            c.getSource().getEmbed().title("Offline load main channel " + toggleStrCaps(enabled));
+                            return 0;
+                        }))));
 
         builder.then(literal("discordbindings")
                 .then(literal("list").executes(c -> {
@@ -469,6 +500,9 @@ public class PearlPlusCommand extends Command {
                 .addField("Whitelist", toggleStr(PLUGIN_CONFIG.autoLoad.whitelistEnabled))
                 .addField("Drop Pearl After Load", toggleStr(PLUGIN_CONFIG.autoLoad.dropPearlAfterLoad))
                 .addField("Offline Load", toggleStr(PLUGIN_CONFIG.offlineLoad.enabled))
+                .addField("Offline Main Channel", toggleStr(PLUGIN_CONFIG.offlineLoad.listenInMainChannel))
+                .addField("Offline Dedicated Channel", PLUGIN_CONFIG.offlineLoad.dedicatedDiscordChannelId == null ? "None" : PLUGIN_CONFIG.offlineLoad.dedicatedDiscordChannelId)
+                .addField("Offline Dedicated Role", PLUGIN_CONFIG.offlineLoad.dedicatedDiscordRoleId == null ? "None" : PLUGIN_CONFIG.offlineLoad.dedicatedDiscordRoleId)
                 .addField("Discord Bindings", Integer.toString(PLUGIN_CONFIG.offlineLoad.discordBindings.size()))
                 .addField("Trusted Discord", Integer.toString(PLUGIN_CONFIG.offlineLoad.trustedDiscordBindings.size()))
                 .primaryColor();
