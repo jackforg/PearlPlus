@@ -10,6 +10,7 @@ import com.zenith.module.api.Module;
 import com.zenith.util.ChatUtil;
 import dev.zenith.pearlplus.PearlPlusConfig;
 import net.dv8tion.jda.api.events.message.MessageReceivedEvent;
+import net.dv8tion.jda.api.hooks.ListenerAdapter;
 
 import java.security.SecureRandom;
 import java.util.HashMap;
@@ -22,6 +23,7 @@ import java.util.UUID;
 import static com.github.rfresh2.EventConsumer.of;
 import static com.zenith.Globals.BARITONE;
 import static com.zenith.Globals.CACHE;
+import static com.zenith.Globals.DISCORD;
 import static dev.zenith.pearlplus.PearlPlusPlugin.LOG;
 import static dev.zenith.pearlplus.PearlPlusPlugin.PLUGIN_CONFIG;
 
@@ -33,8 +35,15 @@ public class OfflineLoadModule extends Module {
     private final SecureRandom random = new SecureRandom();
     private final Map<String, PendingLink> pendingLinksByCode = new HashMap<>();
     private final Map<String, PendingLink> pendingLinksByDiscordId = new HashMap<>();
+    private final ListenerAdapter dedicatedDiscordListener = new ListenerAdapter() {
+        @Override
+        public void onMessageReceived(MessageReceivedEvent event) {
+            onDedicatedDiscordMessage(event);
+        }
+    };
 
     private StagedOfflineLoad activeRequest;
+    private boolean dedicatedDiscordListenerRegistered;
 
     @Override
     public boolean enabledSetting() {
@@ -51,7 +60,13 @@ public class OfflineLoadModule extends Module {
     }
 
     @Override
+    public synchronized void onEnable() {
+        ensureDedicatedDiscordListenerRegistration();
+    }
+
+    @Override
     public synchronized void onDisable() {
+        unregisterDedicatedDiscordListener();
         pendingLinksByCode.clear();
         pendingLinksByDiscordId.clear();
         activeRequest = null;
@@ -151,27 +166,34 @@ public class OfflineLoadModule extends Module {
     }
 
     private void onDiscordCommand(DiscordMainChannelCommandReceivedEvent event) {
-        if (!isEnabled() || event.event().getAuthor().isBot()) {
+        if (!isEnabled() || !PLUGIN_CONFIG.offlineLoad.listenInMainChannel || event.event().getAuthor().isBot()) {
             return;
         }
 
-        cleanupExpiredPendingLinks();
+        if (!handleDiscordMessage(event.event(), event.message())) {
+            return;
+        }
+    }
 
-        ParsedCommand command = parseCommand(event.message());
-        if (command == null) {
+    private void onDedicatedDiscordMessage(MessageReceivedEvent event) {
+        if (!isEnabled() || event.getAuthor().isBot()) {
             return;
         }
 
-        switch (command.kind) {
-            case DISCORD_LINK -> handleDiscordLink(event.event());
-            case OFFLINE_LOAD -> handleOfflineLoad(event.event(), command.arg());
-            case OFFLINE_CANCEL -> handleOfflineCancel(event.event());
-            case OFFLINE_STATUS -> handleOfflineStatus(event.event());
+        if (!isDedicatedDiscordChannelConfigured() || !isDedicatedDiscordChannelMessage(event)) {
+            return;
         }
+
+        if (!hasDedicatedDiscordRole(event)) {
+            return;
+        }
+
+        handleDiscordMessage(event, event.getMessage().getContentRaw());
     }
 
     private void onTick() {
         cleanupExpiredPendingLinks();
+        ensureDedicatedDiscordListenerRegistration();
 
         StagedOfflineLoad request;
         synchronized (this) {
@@ -193,6 +215,23 @@ public class OfflineLoadModule extends Module {
         }
     }
 
+    private boolean handleDiscordMessage(MessageReceivedEvent event, String rawMessage) {
+        cleanupExpiredPendingLinks();
+
+        ParsedCommand command = parseCommand(rawMessage);
+        if (command == null) {
+            return false;
+        }
+
+        switch (command.kind) {
+            case DISCORD_LINK -> handleDiscordLink(event);
+            case OFFLINE_LOAD -> handleOfflineLoad(event, command.arg());
+            case OFFLINE_CANCEL -> handleOfflineCancel(event);
+            case OFFLINE_STATUS -> handleOfflineStatus(event);
+        }
+        return true;
+    }
+
     private synchronized void cleanupExpiredPendingLinks() {
         long now = System.currentTimeMillis();
         Iterator<Map.Entry<String, PendingLink>> iterator = pendingLinksByCode.entrySet().iterator();
@@ -203,6 +242,52 @@ public class OfflineLoadModule extends Module {
                 iterator.remove();
             }
         }
+    }
+
+    private synchronized void ensureDedicatedDiscordListenerRegistration() {
+        if (!isDedicatedDiscordChannelConfigured()) {
+            unregisterDedicatedDiscordListener();
+            return;
+        }
+
+        if (dedicatedDiscordListenerRegistered || DISCORD == null || !DISCORD.isRunning() || DISCORD.jda() == null) {
+            return;
+        }
+
+        DISCORD.jda().addEventListener(dedicatedDiscordListener);
+        dedicatedDiscordListenerRegistered = true;
+        LOG.info("Registered PearlPlus dedicated Discord listener for channel {}", PLUGIN_CONFIG.offlineLoad.dedicatedDiscordChannelId);
+    }
+
+    private synchronized void unregisterDedicatedDiscordListener() {
+        if (!dedicatedDiscordListenerRegistered) {
+            return;
+        }
+
+        if (DISCORD != null && DISCORD.jda() != null) {
+            DISCORD.jda().removeEventListener(dedicatedDiscordListener);
+        }
+        dedicatedDiscordListenerRegistered = false;
+    }
+
+    private boolean isDedicatedDiscordChannelConfigured() {
+        return PLUGIN_CONFIG.offlineLoad.dedicatedDiscordChannelId != null
+                && !PLUGIN_CONFIG.offlineLoad.dedicatedDiscordChannelId.isBlank();
+    }
+
+    private boolean isDedicatedDiscordChannelMessage(MessageReceivedEvent event) {
+        return event.getChannel() != null
+                && PLUGIN_CONFIG.offlineLoad.dedicatedDiscordChannelId.equals(event.getChannel().getId());
+    }
+
+    private boolean hasDedicatedDiscordRole(MessageReceivedEvent event) {
+        String requiredRoleId = PLUGIN_CONFIG.offlineLoad.dedicatedDiscordRoleId;
+        if (requiredRoleId == null || requiredRoleId.isBlank()) {
+            return true;
+        }
+
+        return event.getMember() != null
+                && event.getMember().getRoles().stream().anyMatch(role -> requiredRoleId.equals(role.getId()));
     }
 
     private synchronized String completeBinding(UUID playerUuid, String playerName, String rawCode) {
@@ -491,7 +576,7 @@ public class OfflineLoadModule extends Module {
         }
 
         int index = 0;
-        String first = parts[0].toLowerCase(Locale.ROOT);
+        String first = normalizeCommandToken(parts[0]);
         if ("pp".equals(first) || "pearlplus".equals(first)) {
             index++;
         }
@@ -499,7 +584,7 @@ public class OfflineLoadModule extends Module {
             return null;
         }
 
-        String root = parts[index].toLowerCase(Locale.ROOT);
+        String root = normalizeCommandToken(parts[index]);
         if ("discord".equals(root) && index + 1 < parts.length && "link".equalsIgnoreCase(parts[index + 1])) {
             return new ParsedCommand(CommandKind.DISCORD_LINK, null);
         }
@@ -511,13 +596,24 @@ public class OfflineLoadModule extends Module {
             return new ParsedCommand(CommandKind.OFFLINE_STATUS, null);
         }
 
-        String action = parts[index + 1].toLowerCase(Locale.ROOT);
+        String action = normalizeCommandToken(parts[index + 1]);
         return switch (action) {
             case "load" -> new ParsedCommand(CommandKind.OFFLINE_LOAD, index + 2 < parts.length ? parts[index + 2] : null);
             case "cancel" -> new ParsedCommand(CommandKind.OFFLINE_CANCEL, null);
             case "status" -> new ParsedCommand(CommandKind.OFFLINE_STATUS, null);
             default -> null;
         };
+    }
+
+    private String normalizeCommandToken(String token) {
+        if (token == null) {
+            return "";
+        }
+        int start = 0;
+        while (start < token.length() && token.charAt(start) == '.') {
+            start++;
+        }
+        return token.substring(start).toLowerCase(Locale.ROOT);
     }
 
     private synchronized String nextUniqueCode() {
