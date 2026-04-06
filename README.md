@@ -105,6 +105,14 @@ Additional Discord commands:
 
 `pp offline cancel` cancels your staged offline load.
 
+If your Discord account is trusted for multiple Minecraft accounts, you can target a specific IGN:
+
+`pp offline load <ign>`
+
+or a specific pearl on that IGN:
+
+`pp offline load <ign> <pearlId>`
+
 ### Dedicated Crew Discord Channel
 
 PearlPlus can listen in its own Discord channel instead of Zenith's main command channel. This is useful when you want crew members to use only offline pearl commands without getting access to broader Zenith Discord commands.
