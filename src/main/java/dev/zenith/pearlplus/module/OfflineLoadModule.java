@@ -13,6 +13,8 @@ import net.dv8tion.jda.api.events.message.MessageReceivedEvent;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
 
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -225,7 +227,7 @@ public class OfflineLoadModule extends Module {
 
         switch (command.kind) {
             case DISCORD_LINK -> handleDiscordLink(event);
-            case OFFLINE_LOAD -> handleOfflineLoad(event, command.arg());
+            case OFFLINE_LOAD -> handleOfflineLoad(event, command.arg1(), command.arg2());
             case OFFLINE_CANCEL -> handleOfflineCancel(event);
             case OFFLINE_STATUS -> handleOfflineStatus(event);
         }
@@ -338,10 +340,10 @@ public class OfflineLoadModule extends Module {
         );
     }
 
-    private void handleOfflineLoad(MessageReceivedEvent event, String requestedPearlArg) {
-        PearlPlusConfig.DiscordBinding binding = findOrCreateBinding(event);
+    private void handleOfflineLoad(MessageReceivedEvent event, String arg1, String arg2) {
+        List<PearlPlusConfig.DiscordBinding> candidateBindings = findCandidateBindings(event);
 
-        if (binding == null || binding.playerUuid == null) {
+        if (candidateBindings.isEmpty()) {
             replyToDiscord(event, "Your Discord account is not linked yet. Run `pp discord link`, then whisper `bind CODE` to the bot in game.");
             return;
         }
@@ -359,21 +361,26 @@ public class OfflineLoadModule extends Module {
             return;
         }
 
+        LoadSelection selection = selectOfflineLoad(candidateBindings, arg1, arg2);
+        if (selection.errorMessage() != null) {
+            replyToDiscord(event, selection.errorMessage());
+            return;
+        }
+
+        PearlPlusConfig.DiscordBinding binding = selection.binding();
         var playerEntry = PLUGIN_CONFIG.players.get(binding.playerUuid);
         if (playerEntry == null || playerEntry.pearls == null || playerEntry.pearls.isEmpty()) {
             replyToDiscord(event, "No pearls are stored for " + binding.playerName + ".");
             return;
         }
 
-        String pearlId;
-        if (requestedPearlArg == null || requestedPearlArg.isBlank()) {
+        String pearlId = selection.resolvedPearlId();
+        if (pearlId == null || pearlId.isBlank()) {
             pearlId = pearlManager.defaultPearlId(binding.playerUuid);
-        } else {
-            pearlId = pearlManager.resolvePearlId(binding.playerUuid, requestedPearlArg);
         }
 
         if (pearlId == null || !playerEntry.pearls.containsKey(pearlId)) {
-            replyToDiscord(event, "I couldn't find that pearl ID for " + binding.playerName + ".");
+            replyToDiscord(event, "I couldn't find a usable pearl for " + binding.playerName + ".");
             return;
         }
 
@@ -586,21 +593,25 @@ public class OfflineLoadModule extends Module {
 
         String root = normalizeCommandToken(parts[index]);
         if ("discord".equals(root) && index + 1 < parts.length && "link".equalsIgnoreCase(parts[index + 1])) {
-            return new ParsedCommand(CommandKind.DISCORD_LINK, null);
+            return new ParsedCommand(CommandKind.DISCORD_LINK, null, null);
         }
 
         if (!"offline".equals(root)) {
             return null;
         }
         if (index + 1 >= parts.length) {
-            return new ParsedCommand(CommandKind.OFFLINE_STATUS, null);
+            return new ParsedCommand(CommandKind.OFFLINE_STATUS, null, null);
         }
 
         String action = normalizeCommandToken(parts[index + 1]);
         return switch (action) {
-            case "load" -> new ParsedCommand(CommandKind.OFFLINE_LOAD, index + 2 < parts.length ? parts[index + 2] : null);
-            case "cancel" -> new ParsedCommand(CommandKind.OFFLINE_CANCEL, null);
-            case "status" -> new ParsedCommand(CommandKind.OFFLINE_STATUS, null);
+            case "load" -> new ParsedCommand(
+                    CommandKind.OFFLINE_LOAD,
+                    index + 2 < parts.length ? parts[index + 2] : null,
+                    index + 3 < parts.length ? parts[index + 3] : null
+            );
+            case "cancel" -> new ParsedCommand(CommandKind.OFFLINE_CANCEL, null, null);
+            case "status" -> new ParsedCommand(CommandKind.OFFLINE_STATUS, null, null);
             default -> null;
         };
     }
@@ -644,77 +655,172 @@ public class OfflineLoadModule extends Module {
         return "<@" + discordUserId + ">";
     }
 
-    private PearlPlusConfig.DiscordBinding findOrCreateBinding(MessageReceivedEvent event) {
-        PearlPlusConfig.DiscordBinding binding;
-        synchronized (this) {
-            binding = PLUGIN_CONFIG.offlineLoad.discordBindings.get(event.getAuthor().getId());
-        }
-        if (binding != null && binding.playerUuid != null) {
-            return binding;
-        }
-
-        PearlPlusConfig.TrustedDiscordBinding trustedBinding = findTrustedBinding(event);
-        if (trustedBinding == null) {
-            return binding;
-        }
-
-        UUID playerUuid = trustedBinding.playerUuid != null ? trustedBinding.playerUuid : resolveStoredPlayerUuid(trustedBinding.playerName);
-        String playerName = trustedBinding.playerName != null && !trustedBinding.playerName.isBlank()
-                ? trustedBinding.playerName
-                : resolveStoredPlayerName(playerUuid);
-        if (playerUuid == null || playerName == null || playerName.isBlank()) {
-            return binding;
-        }
-
-        PearlPlusConfig.DiscordBinding trustedLiveBinding = new PearlPlusConfig.DiscordBinding(
-                event.getAuthor().getId(),
-                discordDisplayName(event),
-                playerUuid,
-                playerName
-        );
+    private List<PearlPlusConfig.DiscordBinding> findCandidateBindings(MessageReceivedEvent event) {
+        Map<String, PearlPlusConfig.DiscordBinding> bindings = new LinkedHashMap<>();
 
         synchronized (this) {
-            removeBindingByPlayerUuid(playerUuid);
-            PLUGIN_CONFIG.offlineLoad.discordBindings.put(event.getAuthor().getId(), trustedLiveBinding);
-            trustedBinding.playerUuid = playerUuid;
-            trustedBinding.playerName = playerName;
-            if (trustedBinding.discordUserId == null || trustedBinding.discordUserId.isBlank()) {
-                trustedBinding.discordUserId = event.getAuthor().getId();
-            }
-            if (trustedBinding.discordUsername == null || trustedBinding.discordUsername.isBlank()) {
-                trustedBinding.discordUsername = discordDisplayName(event);
+            PearlPlusConfig.DiscordBinding directBinding = PLUGIN_CONFIG.offlineLoad.discordBindings.get(event.getAuthor().getId());
+            if (isUsableBinding(directBinding)) {
+                bindings.put(bindingKey(directBinding), directBinding);
             }
         }
 
-        LOG.info("Auto-linked trusted Discord user {} to player {}", event.getAuthor().getId(), playerName);
-        return trustedLiveBinding;
-    }
-
-    private PearlPlusConfig.TrustedDiscordBinding findTrustedBinding(MessageReceivedEvent event) {
         String discordUserId = event.getAuthor().getId();
-        String authorName = event.getAuthor().getName();
         String displayName = discordDisplayName(event);
 
         synchronized (this) {
             for (PearlPlusConfig.TrustedDiscordBinding trustedBinding : PLUGIN_CONFIG.offlineLoad.trustedDiscordBindings.values()) {
-                if (trustedBinding == null || trustedBinding.playerName == null || trustedBinding.playerName.isBlank()) {
+                if (!matchesTrustedBinding(event, trustedBinding)) {
                     continue;
                 }
 
-                if (trustedBinding.discordUserId != null && !trustedBinding.discordUserId.isBlank()
-                        && trustedBinding.discordUserId.equals(discordUserId)) {
-                    return trustedBinding;
+                UUID playerUuid = trustedBinding.playerUuid != null ? trustedBinding.playerUuid : resolveStoredPlayerUuid(trustedBinding.playerName);
+                String playerName = trustedBinding.playerName != null && !trustedBinding.playerName.isBlank()
+                        ? trustedBinding.playerName
+                        : resolveStoredPlayerName(playerUuid);
+                if (playerUuid == null || playerName == null || playerName.isBlank()) {
+                    continue;
                 }
 
-                if (trustedBinding.discordUsername != null && !trustedBinding.discordUsername.isBlank()) {
-                    if (trustedBinding.discordUsername.equalsIgnoreCase(displayName)
-                            || trustedBinding.discordUsername.equalsIgnoreCase(authorName)) {
-                        return trustedBinding;
-                    }
+                trustedBinding.playerUuid = playerUuid;
+                trustedBinding.playerName = playerName;
+                if (trustedBinding.discordUserId == null || trustedBinding.discordUserId.isBlank()) {
+                    trustedBinding.discordUserId = discordUserId;
                 }
+                if (trustedBinding.discordUsername == null || trustedBinding.discordUsername.isBlank()) {
+                    trustedBinding.discordUsername = displayName;
+                }
+
+                PearlPlusConfig.DiscordBinding binding = new PearlPlusConfig.DiscordBinding(
+                        discordUserId,
+                        displayName,
+                        playerUuid,
+                        playerName
+                );
+                bindings.putIfAbsent(bindingKey(binding), binding);
+            }
+        }
+
+        return new ArrayList<>(bindings.values());
+    }
+
+    private boolean matchesTrustedBinding(MessageReceivedEvent event, PearlPlusConfig.TrustedDiscordBinding trustedBinding) {
+        if (trustedBinding == null || trustedBinding.playerName == null || trustedBinding.playerName.isBlank()) {
+            return false;
+        }
+
+        String discordUserId = event.getAuthor().getId();
+        String authorName = event.getAuthor().getName();
+        String displayName = discordDisplayName(event);
+
+        if (trustedBinding.discordUserId != null && !trustedBinding.discordUserId.isBlank()
+                && trustedBinding.discordUserId.equals(discordUserId)) {
+            return true;
+        }
+
+        if (trustedBinding.discordUsername != null && !trustedBinding.discordUsername.isBlank()) {
+            if (trustedBinding.discordUsername.equalsIgnoreCase(displayName)
+                    || trustedBinding.discordUsername.equalsIgnoreCase(authorName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isUsableBinding(PearlPlusConfig.DiscordBinding binding) {
+        return binding != null && binding.playerUuid != null && binding.playerName != null && !binding.playerName.isBlank();
+    }
+
+    private String bindingKey(PearlPlusConfig.DiscordBinding binding) {
+        if (binding.playerUuid != null) {
+            return binding.playerUuid.toString();
+        }
+        return binding.playerName.toLowerCase(Locale.ROOT);
+    }
+
+    private LoadSelection selectOfflineLoad(List<PearlPlusConfig.DiscordBinding> bindings, String arg1, String arg2) {
+        if (bindings.isEmpty()) {
+            return new LoadSelection(null, null, "Your Discord account is not linked yet.");
+        }
+
+        String firstArg = blankToNull(arg1);
+        String secondArg = blankToNull(arg2);
+
+        if (firstArg == null) {
+            if (bindings.size() == 1) {
+                return new LoadSelection(bindings.get(0), null, null);
+            }
+            return new LoadSelection(null, null,
+                    "Multiple accounts are linked to your Discord: " + candidateSummary(bindings)
+                            + ". Use `.pp offline load <ign>` or `.pp offline load <ign> <pearlId>`.");
+        }
+
+        PearlPlusConfig.DiscordBinding playerMatch = findBindingByPlayerName(bindings, firstArg);
+        if (playerMatch != null) {
+            if (secondArg == null) {
+                return new LoadSelection(playerMatch, null, null);
+            }
+            String resolved = pearlManager.resolvePearlId(playerMatch.playerUuid, secondArg);
+            if (resolved == null) {
+                return new LoadSelection(null, null, "I couldn't find pearl `" + secondArg + "` for " + playerMatch.playerName + ".");
+            }
+            return new LoadSelection(playerMatch, resolved, null);
+        }
+
+        if (secondArg != null) {
+            return new LoadSelection(null, null,
+                    "I couldn't find linked account `" + firstArg + "`. Available accounts: " + candidateSummary(bindings) + ".");
+        }
+
+        if (bindings.size() == 1) {
+            String resolved = pearlManager.resolvePearlId(bindings.get(0).playerUuid, firstArg);
+            if (resolved == null) {
+                return new LoadSelection(null, null, "I couldn't find pearl `" + firstArg + "` for " + bindings.get(0).playerName + ".");
+            }
+            return new LoadSelection(bindings.get(0), resolved, null);
+        }
+
+        List<LoadSelection> pearlMatches = new ArrayList<>();
+        for (PearlPlusConfig.DiscordBinding binding : bindings) {
+            String resolved = pearlManager.resolvePearlId(binding.playerUuid, firstArg);
+            if (resolved != null) {
+                pearlMatches.add(new LoadSelection(binding, resolved, null));
+            }
+        }
+
+        if (pearlMatches.size() == 1) {
+            return pearlMatches.get(0);
+        }
+        if (pearlMatches.size() > 1) {
+            return new LoadSelection(null, null,
+                    "Pearl `" + firstArg + "` exists on multiple linked accounts. Use `.pp offline load <ign> <pearlId>`.");
+        }
+
+        return new LoadSelection(null, null,
+                "I couldn't tell which account you meant. Linked accounts: " + candidateSummary(bindings)
+                        + ". Use `.pp offline load <ign>` or `.pp offline load <ign> <pearlId>`.");
+    }
+
+    private PearlPlusConfig.DiscordBinding findBindingByPlayerName(List<PearlPlusConfig.DiscordBinding> bindings, String playerName) {
+        for (PearlPlusConfig.DiscordBinding binding : bindings) {
+            if (binding.playerName != null && binding.playerName.equalsIgnoreCase(playerName)) {
+                return binding;
             }
         }
         return null;
+    }
+
+    private String candidateSummary(List<PearlPlusConfig.DiscordBinding> bindings) {
+        return bindings.stream()
+                .map(binding -> binding.playerName)
+                .distinct()
+                .sorted(String.CASE_INSENSITIVE_ORDER)
+                .reduce((a, b) -> a + ", " + b)
+                .orElse("none");
+    }
+
+    private String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
     }
 
     private UUID resolveStoredPlayerUuid(String playerName) {
@@ -771,7 +877,10 @@ public class OfflineLoadModule extends Module {
         OFFLINE_STATUS
     }
 
-    private record ParsedCommand(CommandKind kind, String arg) {
+    private record ParsedCommand(CommandKind kind, String arg1, String arg2) {
+    }
+
+    private record LoadSelection(PearlPlusConfig.DiscordBinding binding, String resolvedPearlId, String errorMessage) {
     }
 
     private record PendingLink(String code, String discordUserId, String discordDisplayName, long expiresAt) {
