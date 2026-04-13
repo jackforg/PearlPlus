@@ -56,7 +56,9 @@ public class PearlManager {
 
     public PearlPlusConfig.StoredPearl recordPearl(UUID ownerUuid, String ownerName, String pearlId, int x, int y, int z) {
         PearlPlusConfig.PlayerPearls entry = PLUGIN_CONFIG.players.computeIfAbsent(ownerUuid, uuid -> new PearlPlusConfig.PlayerPearls());
-        entry.playerName = ownerName;
+        if (ownerName != null && !ownerName.isBlank()) {
+            entry.playerName = ownerName;
+        }
         if (entry.defaultPearlId == null || entry.defaultPearlId.isBlank()) {
             entry.defaultPearlId = pearlId;
         }
@@ -66,6 +68,17 @@ public class PearlManager {
         stored.y = y;
         stored.z = z;
         return stored;
+    }
+
+    public void updatePlayerName(UUID ownerUuid, String ownerName) {
+        if (ownerUuid == null || ownerName == null || ownerName.isBlank()) {
+            return;
+        }
+        PearlPlusConfig.PlayerPearls entry = PLUGIN_CONFIG.players.get(ownerUuid);
+        if (entry == null) {
+            return;
+        }
+        entry.playerName = ownerName;
     }
 
     public void removePearl(UUID ownerUuid, String pearlId) {

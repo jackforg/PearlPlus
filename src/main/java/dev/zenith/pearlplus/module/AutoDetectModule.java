@@ -6,11 +6,17 @@ import com.zenith.cache.data.entity.Entity;
 import com.zenith.discord.Embed;
 import com.zenith.event.client.ClientBotTick;
 import com.zenith.module.api.Module;
+import com.zenith.network.codec.PacketHandlerCodec;
+import com.zenith.network.codec.PacketHandlerStateCodec;
 import com.zenith.util.ChatUtil;
+import dev.zenith.pearlplus.event.EnderPearlSpawnEvent;
+import dev.zenith.pearlplus.feature.autodetect.AutoDetectAddEntityHandler;
 import dev.zenith.pearlplus.PearlPlusConfig;
+import org.geysermc.mcprotocollib.protocol.data.ProtocolState;
 import org.geysermc.mcprotocollib.protocol.data.game.PlayerListEntry;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.object.ProjectileData;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.type.EntityType;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.entity.spawn.ClientboundAddEntityPacket;
 
 import java.util.*;
 
@@ -21,9 +27,11 @@ import static dev.zenith.pearlplus.PearlPlusPlugin.PLUGIN_CONFIG;
 public class AutoDetectModule extends Module {
     private static final long STABLE_LOCATION_DURATION_MS = 3_000L;
     private static final long STORED_PEARL_REMOVAL_GRACE_MS = 60_000L;
+    private static final long RECENT_OWNER_CACHE_MS = 30_000L;
     private static final int POSITION_HISTORY_LIMIT = 8;
 
     private final Map<Integer, TrackedPearl> trackedPearls = new HashMap<>();
+    private final Map<Integer, RecentOwnerSnapshot> recentOwnersByEntityId = new HashMap<>();
     private final PearlManager pearlManager = new PearlManager(this);
     private final Set<Column> acknowledgedColumns = new HashSet<>();
     private boolean pendingReconnectGrace = false;
@@ -37,6 +45,7 @@ public class AutoDetectModule extends Module {
     @Override
     public List<EventConsumer<?>> registerEvents() {
         return List.of(
+                of(EnderPearlSpawnEvent.class, this::handleEnderPearlSpawnEvent),
                 of(ClientBotTick.class, event -> {
                     if (!PLUGIN_CONFIG.autoDetect.enabled) {
                         return;
@@ -51,6 +60,17 @@ public class AutoDetectModule extends Module {
     }
 
     @Override
+    public PacketHandlerCodec registerClientPacketHandlerCodec() {
+        return PacketHandlerCodec.clientBuilder()
+                .setId("pearlplus-autodetect")
+                .setPriority(-5)
+                .state(ProtocolState.GAME, PacketHandlerStateCodec.clientBuilder()
+                        .inbound(ClientboundAddEntityPacket.class, new AutoDetectAddEntityHandler())
+                        .build())
+                .build();
+    }
+
+    @Override
     public void onEnable() {
         extendStoredPearlRemovalGracePeriod();
         markExistingPearls();
@@ -59,6 +79,7 @@ public class AutoDetectModule extends Module {
     @Override
     public void onDisable() {
         trackedPearls.clear();
+        recentOwnersByEntityId.clear();
         pendingReconnectGrace = false;
     }
 
@@ -79,6 +100,7 @@ public class AutoDetectModule extends Module {
 
         Map<Integer, Entity> entities = cache.getEntities();
         long now = System.currentTimeMillis();
+        refreshRecentOwners(entities, now);
 
         for (Entity entity : entities.values()) {
             if (entity.getEntityType() != EntityType.ENDER_PEARL) {
@@ -88,15 +110,61 @@ public class AutoDetectModule extends Module {
             BlockPosition position = blockPositionOf(entity);
             StoredPearlEntry storedEntry = findStoredPearlByColumn(position.x(), position.z()).orElse(null);
             OwnerInfo storedOwner = storedEntry != null ? storedEntry.ownerInfo() : null;
-            OwnerInfo resolvedOwner = resolveOwnerInfo(entity, entities).orElse(null);
+            Integer ownerEntityId = resolveProjectileOwnerEntityId(entity).orElse(null);
+            OwnerInfo resolvedOwner = resolveOwnerInfo(entity, entities, ownerEntityId).orElse(null);
             OwnerInfo owner = selectOwner(resolvedOwner, storedOwner, null);
 
             TrackedPearl tracked = new TrackedPearl(position, owner, now);
+            tracked.setOwnerEntityId(ownerEntityId);
             tracked.setPearlId(storedEntry != null ? storedEntry.pearl().pearlId : null);
             if (storedEntry != null) {
                 acknowledgedColumns.add(columnOf(position));
             }
             trackedPearls.put(entity.getEntityId(), tracked);
+        }
+    }
+
+    private void handleEnderPearlSpawnEvent(EnderPearlSpawnEvent event) {
+        if (!PLUGIN_CONFIG.autoDetect.enabled) {
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        BlockPosition position = blockPositionOf(event.x(), event.y(), event.z());
+        Map<Integer, Entity> entities = CACHE != null && CACHE.getEntityCache() != null
+                ? CACHE.getEntityCache().getEntities()
+                : Map.of();
+        refreshRecentOwners(entities, now);
+
+        StoredPearlEntry storedEntry = findStoredPearlByColumn(position.x(), position.z()).orElse(null);
+        OwnerInfo storedOwner = storedEntry != null ? storedEntry.ownerInfo() : null;
+        OwnerInfo resolvedOwner = resolveOwnerFromOwnerEntityId(event.ownerEntityId(), entities).orElse(null);
+
+        TrackedPearl tracked = trackedPearls.get(event.pearlEntityId());
+        if (tracked == null) {
+            OwnerInfo owner = selectOwner(resolvedOwner, storedOwner, null);
+            tracked = new TrackedPearl(position, owner, now);
+            tracked.setOwnerEntityId(event.ownerEntityId());
+            tracked.setPearlId(storedEntry != null ? storedEntry.pearl().pearlId : null);
+            trackedPearls.put(event.pearlEntityId(), tracked);
+
+            info(String.format(
+                    "Detected new ender pearl spawn packet (id=%d, ownerEntityId=%d) at [block %d %d %d] thrown by %s",
+                    event.pearlEntityId(),
+                    event.ownerEntityId(),
+                    position.x(),
+                    position.y(),
+                    position.z(),
+                    formatOwner(owner)
+            ));
+            return;
+        }
+
+        tracked.setOwnerEntityId(event.ownerEntityId());
+        tracked.updatePosition(position, now);
+        tracked.setOwner(selectOwner(resolvedOwner, storedOwner, tracked.owner()));
+        if (storedEntry != null && storedEntry.pearl().pearlId != null) {
+            tracked.setPearlId(storedEntry.pearl().pearlId);
         }
     }
 
@@ -114,6 +182,8 @@ public class AutoDetectModule extends Module {
 
         Map<Integer, Entity> entities = entityCache.getEntities();
         long now = System.currentTimeMillis();
+        refreshRecentOwners(entities, now);
+        pruneRecentOwners(now);
 
         trackedPearls.entrySet().removeIf(entry -> {
             Entity entity = entities.get(entry.getKey());
@@ -133,18 +203,21 @@ public class AutoDetectModule extends Module {
             BlockPosition position = blockPositionOf(entity);
             StoredPearlEntry storedEntry = findStoredPearlByColumn(position.x(), position.z()).orElse(null);
             OwnerInfo storedOwner = storedEntry != null ? storedEntry.ownerInfo() : null;
-            OwnerInfo resolvedOwner = resolveOwnerInfo(entity, entities).orElse(null);
+            Integer ownerEntityId = resolveProjectileOwnerEntityId(entity).orElse(null);
 
             TrackedPearl tracked = trackedPearls.get(entityId);
             if (tracked == null) {
+                OwnerInfo resolvedOwner = resolveOwnerInfo(entity, entities, ownerEntityId).orElse(null);
                 OwnerInfo owner = selectOwner(resolvedOwner, storedOwner, null);
                 tracked = new TrackedPearl(position, owner, now);
+                tracked.setOwnerEntityId(ownerEntityId);
                 tracked.setPearlId(storedEntry != null ? storedEntry.pearl().pearlId : null);
                 trackedPearls.put(entityId, tracked);
 
                 info(String.format(
-                        "Detected new ender pearl (id=%d) at (%.2f, %.2f, %.2f) [block %d %d %d] thrown by %s",
+                        "Detected new ender pearl (id=%d, ownerEntityId=%d) at (%.2f, %.2f, %.2f) [block %d %d %d] thrown by %s",
                         entityId,
+                        ownerEntityId == null ? -1 : ownerEntityId,
                         entity.getX(),
                         entity.getY(),
                         entity.getZ(),
@@ -155,6 +228,10 @@ public class AutoDetectModule extends Module {
                 ));
             } else {
                 tracked.updatePosition(position, now);
+                if (ownerEntityId != null && ownerEntityId > 0) {
+                    tracked.setOwnerEntityId(ownerEntityId);
+                }
+                OwnerInfo resolvedOwner = resolveOwnerInfo(entity, entities, tracked.ownerEntityId()).orElse(null);
                 OwnerInfo owner = selectOwner(resolvedOwner, storedOwner, tracked.owner());
                 tracked.setOwner(owner);
                 if (storedEntry != null && storedEntry.pearl().pearlId != null) {
@@ -208,9 +285,10 @@ public class AutoDetectModule extends Module {
 
     private void attemptAutoRegistration(long now) {
         for (TrackedPearl tracked : trackedPearls.values()) {
-            if (!tracked.ownerHasName() || tracked.owner().uuid() == null) {
+            tracked.setOwner(resolveKnownOwnerInfo(tracked.ownerEntityId(), tracked.owner()));
+            if (tracked.owner() == null || tracked.owner().uuid() == null) {
                 if (!tracked.waitingForNameLogged()) {
-                    info("Waiting for thrower's name/uuid before auto-registering loader");
+                    info("Waiting for thrower's uuid before auto-registering loader");
                     tracked.markWaitingForNameLogged();
                 }
                 continue;
@@ -240,13 +318,15 @@ public class AutoDetectModule extends Module {
                         && storedPearl.pearl().pearlId != null
                         && tracked.owner() != null
                         && tracked.owner().uuid() != null) {
+                    String ownerName = preferredOwnerName(tracked.owner());
                     pearlManager.recordPearl(
                             tracked.owner().uuid(),
-                            tracked.owner().name(),
+                            ownerName,
                             storedPearl.pearl().pearlId,
                             target.x(),
                             target.y(),
                             target.z());
+                    pearlManager.updatePlayerName(tracked.owner().uuid(), ownerName);
 
                     acknowledgedColumns.add(column);
                 }
@@ -272,9 +352,10 @@ public class AutoDetectModule extends Module {
                     tracked.ownerSummary()
             ));
 
-            pearlManager.recordPearl(tracked.owner().uuid(), tracked.owner().name(), pearlId, target.x(), target.y(), target.z());
+            String ownerName = preferredOwnerName(tracked.owner());
+            pearlManager.recordPearl(tracked.owner().uuid(), ownerName, pearlId, target.x(), target.y(), target.z());
+            pearlManager.updatePlayerName(tracked.owner().uuid(), ownerName);
 
-            String ownerName = tracked.owner() != null ? tracked.owner().name() : null;
             if (ownerName != null && !ownerName.isBlank() && sendRegistrationWhisper(ownerName, pearlId)) {
                 tracked.markRegistrationNotified();
             }
@@ -392,33 +473,57 @@ public class AutoDetectModule extends Module {
         return false;
     }
 
-    private Optional<OwnerInfo> resolveOwnerInfo(Entity pearl, Map<Integer, Entity> entities) {
-        Optional<OwnerInfo> resolved = resolveOwnerFromProjectileOwner(pearl, entities);
+    private Optional<OwnerInfo> resolveOwnerInfo(Entity pearl, Map<Integer, Entity> entities, Integer rememberedOwnerEntityId) {
+        Optional<OwnerInfo> resolved = resolveOwnerFromProjectileOwner(pearl, entities, rememberedOwnerEntityId);
         if (resolved.isPresent() || !PLUGIN_CONFIG.autoDetect.distanceCheck) {
             return resolved;
         }
         return resolveOwnerFromClosestPlayer(pearl, entities);
     }
 
-    private Optional<OwnerInfo> resolveOwnerFromProjectileOwner(Entity pearl, Map<Integer, Entity> entities) {
-        var data = pearl.getObjectData();
-        if (!(data instanceof ProjectileData projectileData)) {
+    private Optional<OwnerInfo> resolveOwnerFromProjectileOwner(Entity pearl, Map<Integer, Entity> entities, Integer rememberedOwnerEntityId) {
+        Integer ownerEntityId = resolveProjectileOwnerEntityId(pearl).orElse(rememberedOwnerEntityId);
+        if (ownerEntityId == null || ownerEntityId <= 0) {
             return Optional.empty();
         }
+        return resolveOwnerFromOwnerEntityId(ownerEntityId, entities);
+    }
 
-        int ownerEntityId = projectileData.getOwnerId();
-        if (ownerEntityId <= 0) {
-            return Optional.empty();
-        }
-
-        Entity ownerEntity = entities.get(ownerEntityId);
+    private Optional<OwnerInfo> resolveOwnerFromOwnerEntityId(int ownerEntityId, Map<Integer, Entity> entities) {
+        Entity ownerEntity = entities != null ? entities.get(ownerEntityId) : null;
         UUID ownerUuid = ownerEntity != null ? ownerEntity.getUuid() : null;
         String ownerName = ownerUuid != null ? resolveOwnerName(ownerUuid).orElse(null) : null;
+
+        RecentOwnerSnapshot recentOwner = recentOwnersByEntityId.get(ownerEntityId);
+        if (ownerUuid == null && recentOwner != null) {
+            ownerUuid = recentOwner.uuid();
+        }
+        if ((ownerName == null || ownerName.isBlank()) && recentOwner != null) {
+            ownerName = recentOwner.name();
+        }
+        if ((ownerName == null || ownerName.isBlank()) && ownerUuid != null) {
+            ownerName = resolveOwnerName(ownerUuid).orElse(null);
+            if (ownerName == null || ownerName.isBlank()) {
+                ownerName = storedPlayerName(ownerUuid);
+            }
+        }
 
         if (ownerUuid == null && ownerName == null) {
             return Optional.empty();
         }
         return Optional.of(new OwnerInfo(ownerUuid, ownerName));
+    }
+
+    private Optional<Integer> resolveProjectileOwnerEntityId(Entity pearl) {
+        if (pearl == null) {
+            return Optional.empty();
+        }
+        var data = pearl.getObjectData();
+        if (!(data instanceof ProjectileData projectileData)) {
+            return Optional.empty();
+        }
+        int ownerEntityId = projectileData.getOwnerId();
+        return ownerEntityId > 0 ? Optional.of(ownerEntityId) : Optional.empty();
     }
 
     private Optional<OwnerInfo> resolveOwnerFromClosestPlayer(Entity pearl, Map<Integer, Entity> entities) {
@@ -475,11 +580,108 @@ public class AutoDetectModule extends Module {
                 .filter(name -> !name.isBlank());
     }
 
+    private void refreshRecentOwners(Map<Integer, Entity> entities, long now) {
+        if (entities == null || entities.isEmpty()) {
+            return;
+        }
+
+        for (Entity entity : entities.values()) {
+            if (entity.getEntityType() != EntityType.PLAYER || entity.getEntityId() <= 0) {
+                continue;
+            }
+
+            UUID uuid = entity.getUuid();
+            RecentOwnerSnapshot existing = recentOwnersByEntityId.get(entity.getEntityId());
+            String name = uuid != null ? resolveOwnerName(uuid).orElse(null) : null;
+            if ((name == null || name.isBlank()) && existing != null) {
+                name = existing.name();
+            }
+            if ((name == null || name.isBlank()) && uuid != null) {
+                name = storedPlayerName(uuid);
+            }
+            if (uuid == null && existing != null) {
+                uuid = existing.uuid();
+            }
+            if (uuid == null && (name == null || name.isBlank())) {
+                continue;
+            }
+
+            recentOwnersByEntityId.put(entity.getEntityId(), new RecentOwnerSnapshot(entity.getEntityId(), uuid, name, now));
+        }
+    }
+
+    private void pruneRecentOwners(long now) {
+        recentOwnersByEntityId.entrySet().removeIf(entry -> now - entry.getValue().lastSeenAt() > RECENT_OWNER_CACHE_MS);
+    }
+
+    private OwnerInfo resolveKnownOwnerInfo(Integer ownerEntityId, OwnerInfo fallback) {
+        if (ownerEntityId != null && ownerEntityId > 0) {
+            OwnerInfo resolved = resolveOwnerFromOwnerEntityId(
+                    ownerEntityId,
+                    CACHE != null && CACHE.getEntityCache() != null ? CACHE.getEntityCache().getEntities() : Map.of()
+            ).orElse(null);
+            return selectOwner(resolved, null, fallback);
+        }
+
+        if (fallback != null && fallback.uuid() != null) {
+            String ownerName = preferredOwnerName(fallback);
+            if (ownerName != null && !ownerName.isBlank() && !ownerName.equals(fallback.name())) {
+                return new OwnerInfo(fallback.uuid(), ownerName);
+            }
+        }
+        return fallback;
+    }
+
+    private String preferredOwnerName(OwnerInfo owner) {
+        if (owner == null) {
+            return null;
+        }
+        if (owner.hasName()) {
+            return owner.name();
+        }
+        if (owner.uuid() == null) {
+            return null;
+        }
+
+        String resolved = resolveOwnerName(owner.uuid()).orElse(null);
+        if (resolved != null && !resolved.isBlank()) {
+            return resolved;
+        }
+
+        String stored = storedPlayerName(owner.uuid());
+        if (stored != null && !stored.isBlank()) {
+            return stored;
+        }
+
+        for (RecentOwnerSnapshot snapshot : recentOwnersByEntityId.values()) {
+            if (owner.uuid().equals(snapshot.uuid()) && snapshot.name() != null && !snapshot.name().isBlank()) {
+                return snapshot.name();
+            }
+        }
+        return null;
+    }
+
+    private String storedPlayerName(UUID ownerUuid) {
+        if (ownerUuid == null) {
+            return null;
+        }
+        PearlPlusConfig.PlayerPearls playerPearls = PLUGIN_CONFIG.players.get(ownerUuid);
+        return playerPearls != null ? playerPearls.playerName : null;
+    }
+
     private BlockPosition blockPositionOf(Entity entity) {
         return new BlockPosition(
                 (int) Math.floor(entity.getX()),
                 (int) Math.round(entity.getY()), // Replaced floor with round, since in rare cases the pearl Y location was wrong.
                 (int) Math.floor(entity.getZ())
+        );
+    }
+
+    private BlockPosition blockPositionOf(double x, double y, double z) {
+        return new BlockPosition(
+                (int) Math.floor(x),
+                (int) Math.round(y),
+                (int) Math.floor(z)
         );
     }
 
@@ -630,10 +832,14 @@ public class AutoDetectModule extends Module {
         }
     }
 
+    private record RecentOwnerSnapshot(int entityId, UUID uuid, String name, long lastSeenAt) {
+    }
+
     private static final class TrackedPearl {
         private BlockPosition position;
         private final Deque<BlockPosition> history = new ArrayDeque<>();
         private OwnerInfo owner;
+        private Integer ownerEntityId;
         private String pearlId;
         private boolean waitingForNameLogged;
         private long lastMovedAt;
@@ -671,6 +877,16 @@ public class AutoDetectModule extends Module {
 
         OwnerInfo owner() {
             return owner;
+        }
+
+        void setOwnerEntityId(Integer ownerEntityId) {
+            if (ownerEntityId != null && ownerEntityId > 0) {
+                this.ownerEntityId = ownerEntityId;
+            }
+        }
+
+        Integer ownerEntityId() {
+            return ownerEntityId;
         }
 
         boolean ownerHasName() {

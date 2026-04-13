@@ -185,6 +185,8 @@ Use the `pp add/del` commands to set up manually.
 
 By default, the bot resolves the username of pearl throwers with entity ID's. Some servers might not allow this so if the bot is unable to register pearls automatically use `pp distancecheck on`. This will get the throwers name from the closest player to the pearl. 2b2t players have reported autodetect ceasing to work occasionally. Always test before enabling this feature.
 
+PearlPlus now also captures pearl spawn ownership at packet time and can register from the thrower's UUID before their name resolves, which makes the default owner-id path more reliable on laggy servers like 2b2t.
+
 By default, you can add a random word after `load` or the `pearlID` to get around anti-spam. This can be disabled using `pp strict on`.
 
 #### Recommended Zenith settings
