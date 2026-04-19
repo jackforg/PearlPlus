@@ -20,6 +20,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 import static com.github.rfresh2.EventConsumer.of;
@@ -421,8 +422,7 @@ public class OfflineLoadModule extends Module {
                 .addField("Pearl", pearl.pearlId)
                 .primaryColor());
 
-        BARITONE.pathTo((int) preparedLoadTarget.pathPos().x(), (int) preparedLoadTarget.pathPos().z())
-                .addExecutedListener(future -> onStagePathComplete(request));
+        pathOfflineRequest(request);
     }
 
     private void handleOfflineCancel(MessageReceivedEvent event) {
@@ -473,8 +473,22 @@ public class OfflineLoadModule extends Module {
         }
 
         if (!pearlManager.isNearPreparedLoadTarget(request.preparedLoadTarget, READY_DISTANCE_BLOCKS)) {
+            if (retryOfflinePreparedTarget(request, "I couldn't get into position for the offline load.")) {
+                return;
+            }
             clearActiveRequest(request, "I couldn't get into position for the offline load.", true);
             sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " I couldn't get into position for `" + request.pearl.pearlId + "`.");
+            return;
+        }
+
+        if (!pearlManager.isClickTargetReachableFromCurrentPosition(request.preparedLoadTarget)) {
+            String reason = pearlManager.unreachableClickTargetMessage(request.preparedLoadTarget, request.pearl);
+            LOG.warn(reason);
+            if (retryOfflinePreparedTarget(request, reason)) {
+                return;
+            }
+            clearActiveRequest(request, reason, true);
+            sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " " + reason);
             return;
         }
 
@@ -526,7 +540,46 @@ public class OfflineLoadModule extends Module {
             return;
         }
 
+        if (!pearlManager.isClickTargetReachableFromCurrentPosition(request.preparedLoadTarget)) {
+            String reason = pearlManager.unreachableClickTargetMessage(request.preparedLoadTarget, request.pearl);
+            LOG.warn(reason);
+            sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " " + reason);
+            returnToStartPosition(request.startPos);
+            return;
+        }
+
         pearlManager.triggerPreparedLoad(request.preparedLoadTarget, request.pearl, request.playerName, request.startPos);
+    }
+
+    private void pathOfflineRequest(StagedOfflineLoad request) {
+        PearlManager.PreparedLoadTarget preparedLoadTarget = request.preparedLoadTarget;
+        if (preparedLoadTarget == null) {
+            clearActiveRequest(request, "I couldn't prepare a click target for the offline load.", true);
+            sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " I couldn't prepare a click target for `" + request.pearl.pearlId + "`.");
+            return;
+        }
+
+        BARITONE.pathTo((int) preparedLoadTarget.pathPos().x(), (int) preparedLoadTarget.pathPos().y(), (int) preparedLoadTarget.pathPos().z())
+                .addExecutedListener(future -> onStagePathComplete(request));
+    }
+
+    private boolean retryOfflinePreparedTarget(StagedOfflineLoad request, String failureReason) {
+        Optional<PearlManager.PreparedLoadTarget> nextTarget = pearlManager.advancePreparedLoadTarget(request.pearl, request.preparedLoadTarget);
+        if (nextTarget.isEmpty()) {
+            return false;
+        }
+
+        request.preparedLoadTarget = nextTarget.get();
+        PearlManager.PreparedLoadTarget retryTarget = request.preparedLoadTarget;
+        LOG.info("Retrying offline load for {} / {} from alternate stand position [{}, {}, {}] after failure: {}",
+                request.playerName,
+                request.pearl.pearlId,
+                retryTarget.pathPos().x(),
+                retryTarget.pathPos().y(),
+                retryTarget.pathPos().z(),
+                failureReason);
+        pathOfflineRequest(request);
+        return true;
     }
 
     private synchronized void clearActiveRequest(StagedOfflineLoad request, String reason, boolean returnToStart) {
@@ -893,7 +946,7 @@ public class OfflineLoadModule extends Module {
         private final UUID playerUuid;
         private final String playerName;
         private final PearlPlusConfig.StoredPearl pearl;
-        private final PearlManager.PreparedLoadTarget preparedLoadTarget;
+        private PearlManager.PreparedLoadTarget preparedLoadTarget;
         private final BlockPos startPos;
         private boolean armed;
         private long expiresAt;

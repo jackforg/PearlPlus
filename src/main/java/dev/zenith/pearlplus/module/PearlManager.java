@@ -24,6 +24,10 @@ import static dev.zenith.pearlplus.PearlPlusPlugin.LOG;
 import static dev.zenith.pearlplus.PearlPlusPlugin.PLUGIN_CONFIG;
 
 public class PearlManager {
+    private static final int TRAPDOOR_SEARCH_RADIUS = 3;
+    private static final double MAX_CLICK_REACH_DISTANCE = 4.75D;
+    private static final double PATH_ARRIVAL_DISTANCE_BLOCKS = 6.0D;
+    private static final int MAX_PREPARED_TARGET_REFRESHES = 1;
     private final Module notifier;
 
     public PearlManager(Module notifier) {
@@ -33,7 +37,20 @@ public class PearlManager {
     public record PlayerPearl(UUID ownerUuid, String ownerName, PearlPlusConfig.StoredPearl pearl) {
     }
 
-    public record PreparedLoadTarget(BlockPos clickPos, BlockPos pathPos, boolean pathBeforeClick) {
+    public record PreparedLoadTarget(
+            BlockPos clickPos,
+            BlockPos pathPos,
+            boolean pathBeforeClick,
+            List<BlockPos> fallbackPathPositions,
+            int refreshAttempt
+    ) {
+        public PreparedLoadTarget {
+            fallbackPathPositions = fallbackPathPositions == null ? List.of() : List.copyOf(fallbackPathPositions);
+        }
+
+        public PreparedLoadTarget(BlockPos clickPos, BlockPos pathPos, boolean pathBeforeClick) {
+            this(clickPos, pathPos, pathBeforeClick, List.of(), 0);
+        }
     }
 
     public Optional<PlayerPearl> findPearl(UUID ownerUuid, String pearlId) {
@@ -184,10 +201,9 @@ public class PearlManager {
         return distance <= PLUGIN_CONFIG.autoDetect.temporaryRemovalRange;
     }
 
-    // find the nearest trapdoor block around the stored pearl location.
-    public BlockPos findNearestTrapdoorAround(final PearlPlusConfig.StoredPearl pearl, final int radius) {
+    public List<BlockPos> findTrapdoorCandidatesAround(final PearlPlusConfig.StoredPearl pearl, final int radius) {
         if (pearl == null || CACHE == null || CACHE.getChunkCache() == null) {
-            return null;
+            return List.of();
         }
 
         var chunkCache = CACHE.getChunkCache();
@@ -196,8 +212,7 @@ public class PearlManager {
         final int baseY = pearl.y;
         final int baseZ = pearl.z;
 
-        BlockPos bestPos = null;
-        int bestDistSq = Integer.MAX_VALUE;
+        List<TrapdoorCandidate> candidates = new ArrayList<>();
 
         for (int dx = -radius; dx <= radius; dx++) {
             final int x = baseX + dx;
@@ -232,22 +247,24 @@ public class PearlManager {
                         continue;
                     }
 
-                    int distSq = dx * dx + dy * dy + dz * dz;
-                    if (distSq < bestDistSq) {
-                        bestDistSq = distSq;
-                        bestPos = new BlockPos(x, y, z);
-                    }
+                    BlockPos candidate = new BlockPos(x, y, z);
+                    candidates.add(new TrapdoorCandidate(candidate, scoreTrapdoorCandidate(baseX, baseY, baseZ, x, y, z)));
                 }
             }
         }
 
-        return bestPos;
+        candidates.sort((a, b) -> Integer.compare(a.score(), b.score()));
+        List<BlockPos> trapdoors = new ArrayList<>(candidates.size());
+        for (TrapdoorCandidate candidate : candidates) {
+            trapdoors.add(candidate.pos());
+        }
+        return trapdoors;
     }
 
-    public BlockPos findAdjacentWalkableBlock(final BlockPos trapdoorPos) {
+    public List<BlockPos> findAdjacentWalkableBlocks(final BlockPos trapdoorPos) {
         if (trapdoorPos == null || CACHE == null || CACHE.getChunkCache() == null) {
             info("Walkable search aborted: missing trapdoorPos or chunk cache");
-            return null;
+            return List.of();
         }
 
         var chunkCache = CACHE.getChunkCache();
@@ -256,79 +273,63 @@ public class PearlManager {
         final int ty = (int) trapdoorPos.y();
         final int tz = (int) trapdoorPos.z();
 
-        // check 4 cardinal neighbours around the trapdoor
         int[][] offsets = {
                 { 1, 0 },
                 { -1, 0 },
                 { 0, 1 },
-                { 0, -1 }
+                { 0, -1 },
+                { 1, 1 },
+                { 1, -1 },
+                { -1, 1 },
+                { -1, -1 },
+                { 2, 0 },
+                { -2, 0 },
+                { 0, 2 },
+                { 0, -2 }
         };
+        int[] feetYOffsets = {0, -1, 1, 2};
+        List<BlockPos> walkPositions = new ArrayList<>();
 
-        for (int[] off : offsets) {
-            int x = tx + off[0];
-            int z = tz + off[1];
-            int groundY = ty - 1; // assume floor is one below trapdoor
-
-            // ground block
-            var groundSection = chunkCache.getChunkSection(x, groundY, z);
-            if (groundSection == null) {
-                continue;
-            }
-
-            int relX = x & 15;
-            int relY = groundY & 15;
-            int relZ = z & 15;
-
-            int groundStateId = groundSection.getBlock(relX, relY, relZ);
-            if (groundStateId == 0) {
-                // air / unknown not walkable
-                continue;
-            }
-
-            var groundBlock = BLOCK_DATA.getBlockDataFromBlockStateId(groundStateId);
-            if (groundBlock == null) {
-                continue;
-            }
-
-            String groundName = groundBlock.name();
-
-            if (groundName.contains("water")
-                    || groundName.contains("lava")
-                    || groundName.endsWith("_trapdoor")
-                    || groundName.contains("ladder")
-                    || groundName.contains("vine")
-                    || groundName.contains("scaffolding")) {
-                continue;
-            }
-
-            // check the space where the player will stand
-            int headY = groundY + 1;
-            var headSection = chunkCache.getChunkSection(x, headY, z);
-            if (headSection == null) {
-                continue;
-            }
-
-            int headStateId = headSection.getBlock(x & 15, headY & 15, z & 15);
-            if (headStateId != 0) {
-                var headBlock = BLOCK_DATA.getBlockDataFromBlockStateId(headStateId);
-                if (headBlock != null) {
-                    String headName = headBlock.name();
-                    if (!headName.contains("air")) {
-                        continue;
-                    }
+        for (int feetYOffset : feetYOffsets) {
+            int feetY = ty + feetYOffset;
+            for (int[] off : offsets) {
+                int x = tx + off[0];
+                int z = tz + off[1];
+                if (!isStandPositionValid(chunkCache, x, feetY, z)) {
+                    continue;
                 }
-            }
 
-            BlockPos walkPos = new BlockPos(x, groundY, z);
-            info("Found adjacent walkable block near trapdoor at ["
-                    + tx + ", " + ty + ", " + tz + "] -> ["
-                    + walkPos.x() + ", " + walkPos.y() + ", " + walkPos.z() + "]");
-            return walkPos;
+                BlockPos walkPos = new BlockPos(x, feetY, z);
+                if (!canReachClickTargetFromPosition(walkPos, trapdoorPos, MAX_CLICK_REACH_DISTANCE)) {
+                    info("Rejected stand position ["
+                            + walkPos.x() + ", " + walkPos.y() + ", " + walkPos.z()
+                            + "] for trapdoor ["
+                            + tx + ", " + ty + ", " + tz
+                            + "] because the click target would be out of reach");
+                    continue;
+                }
+
+                if (walkPositions.contains(walkPos)) {
+                    continue;
+                }
+
+                info("Found verified stand position near trapdoor at ["
+                        + tx + ", " + ty + ", " + tz + "] -> ["
+                        + walkPos.x() + ", " + walkPos.y() + ", " + walkPos.z() + "]");
+                walkPositions.add(walkPos);
+            }
         }
 
-        info("No adjacent walkable block found around trapdoor at ["
-                + tx + ", " + ty + ", " + tz + "]");
-        return null;
+        if (walkPositions.isEmpty()) {
+            info("No verified stand position found around trapdoor at ["
+                    + tx + ", " + ty + ", " + tz + "]");
+        }
+        return walkPositions;
+    }
+
+    public BlockPos findAdjacentWalkableBlock(final BlockPos trapdoorPos) {
+        List<BlockPos> walkPositions = findAdjacentWalkableBlocks(trapdoorPos);
+        return walkPositions.isEmpty() ? null : walkPositions.get(0);
     }
 
     public String validateCanLoad() {
@@ -346,33 +347,43 @@ public class PearlManager {
     }
 
     public Optional<PreparedLoadTarget> prepareLoadTarget(PearlPlusConfig.StoredPearl pearl) {
+        return prepareLoadTarget(pearl, 0);
+    }
+
+    private Optional<PreparedLoadTarget> prepareLoadTarget(PearlPlusConfig.StoredPearl pearl, int refreshAttempt) {
         if (pearl == null) {
             return Optional.empty();
         }
 
-        BlockPos trapdoorPos = findNearestTrapdoorAround(pearl, 3);
-        if (trapdoorPos == null) {
-            info("No trapdoor detected for pearl " + pearl.pearlId
-                    + ", falling back to original behaviour (click stored block)");
-            BlockPos targetPos = new BlockPos(pearl.x, pearl.y, pearl.z);
-            return Optional.of(new PreparedLoadTarget(targetPos, targetPos, false));
+        BlockPos targetPos = new BlockPos(pearl.x, pearl.y, pearl.z);
+        String targetBlockName = blockNameAt(CACHE != null ? CACHE.getChunkCache() : null, pearl.x, pearl.y, pearl.z);
+
+        if (targetBlockName == null) {
+            info("Stored click target for pearl " + pearl.pearlId + " at ["
+                    + pearl.x + ", " + pearl.y + ", " + pearl.z
+                    + "] is not loaded in chunk cache yet");
+        } else if (!targetBlockName.endsWith("_trapdoor")) {
+            info("Stored click target for pearl " + pearl.pearlId + " at ["
+                    + pearl.x + ", " + pearl.y + ", " + pearl.z
+                    + "] is " + targetBlockName + ", not a trapdoor; still using stored coords as click target");
+        } else {
+            info("Using stored trapdoor coords for pearl " + pearl.pearlId + " at ["
+                    + pearl.x + ", " + pearl.y + ", " + pearl.z + "]");
         }
 
-        int trapX = (int) trapdoorPos.x();
-        int trapY = (int) trapdoorPos.y();
-        int trapZ = (int) trapdoorPos.z();
-        info("Loading pearl " + pearl.pearlId + " using trapdoor at ["
-                + trapX + ", " + trapY + ", " + trapZ + "]");
-
-        BlockPos walkPos = findAdjacentWalkableBlock(trapdoorPos);
-        if (walkPos != null) {
-            info("Pathing to adjacent walkable block [" + walkPos.x() + ", " + walkPos.y() + ", " + walkPos.z() + "]"
-                    + " and then clicking trapdoor");
-            return Optional.of(new PreparedLoadTarget(trapdoorPos, walkPos, true));
+        List<BlockPos> walkPositions = findAdjacentWalkableBlocks(targetPos);
+        if (walkPositions.isEmpty()) {
+            info("No verified stand position found around stored click target for pearl " + pearl.pearlId);
+            return Optional.empty();
         }
 
-        info("No adjacent walkable block found, pathing directly to trapdoor column [" + trapX + ", " + trapZ + "]");
-        return Optional.of(new PreparedLoadTarget(trapdoorPos, trapdoorPos, true));
+        BlockPos walkPos = walkPositions.get(0);
+        List<BlockPos> fallbackWalkPositions = walkPositions.size() > 1
+                ? new ArrayList<>(walkPositions.subList(1, walkPositions.size()))
+                : List.of();
+        info("Pathing to verified stand position [" + walkPos.x() + ", " + walkPos.y() + ", " + walkPos.z() + "]"
+                + " and then clicking stored target [" + targetPos.x() + ", " + targetPos.y() + ", " + targetPos.z() + "]");
+        return Optional.of(new PreparedLoadTarget(targetPos, walkPos, true, fallbackWalkPositions, refreshAttempt));
     }
 
     public boolean isNearPreparedLoadTarget(PreparedLoadTarget preparedLoadTarget, double maxDistance) {
@@ -388,8 +399,39 @@ public class PearlManager {
         return Math.sqrt(dx * dx + dy * dy + dz * dz) <= maxDistance;
     }
 
+    public boolean isClickTargetReachableFromCurrentPosition(PreparedLoadTarget preparedLoadTarget) {
+        if (preparedLoadTarget == null || CACHE == null || CACHE.getPlayerCache() == null || CACHE.getPlayerCache().getThePlayer() == null) {
+            return false;
+        }
+        return canReachClickTargetFromPosition(CACHE.getPlayerCache().getThePlayer().blockPos(), preparedLoadTarget.clickPos(), MAX_CLICK_REACH_DISTANCE);
+    }
+
+    public String unreachableClickTargetMessage(PreparedLoadTarget preparedLoadTarget, PearlPlusConfig.StoredPearl pearl) {
+        BlockPos clickPos = preparedLoadTarget != null ? preparedLoadTarget.clickPos() : null;
+        BlockPos playerPos = CACHE != null && CACHE.getPlayerCache() != null && CACHE.getPlayerCache().getThePlayer() != null
+                ? CACHE.getPlayerCache().getThePlayer().blockPos()
+                : null;
+        String pearlId = pearl != null ? pearl.pearlId : "unknown";
+        return "Click target for pearl "
+                + pearlId
+                + " is unreachable from final position. player="
+                + formatBlockPos(playerPos)
+                + " target="
+                + formatBlockPos(clickPos);
+    }
+
     public void triggerPreparedLoad(PreparedLoadTarget preparedLoadTarget, PearlPlusConfig.StoredPearl pearl, String requesterName, BlockPos startPos) {
         if (preparedLoadTarget == null || pearl == null) {
+            return;
+        }
+
+        if (!isClickTargetReachableFromCurrentPosition(preparedLoadTarget)) {
+            String reason = unreachableClickTargetMessage(preparedLoadTarget, pearl);
+            LOG.warn(reason);
+            notifier.discordAndIngameNotification(Embed.builder()
+                    .title("Can't Load Pearl")
+                    .description(reason)
+                    .errorColor());
             return;
         }
 
@@ -465,13 +507,209 @@ public class PearlManager {
                 .addField("Pearl", pearl.pearlId, false)
                 .primaryColor());
 
+        attemptPreparedLoad(pearl, preparedLoadTarget, requesterName, startPos);
+    }
+
+    public Optional<PreparedLoadTarget> advancePreparedLoadTarget(PearlPlusConfig.StoredPearl pearl, PreparedLoadTarget preparedLoadTarget) {
+        if (preparedLoadTarget == null) {
+            return Optional.empty();
+        }
+
+        if (!preparedLoadTarget.fallbackPathPositions().isEmpty()) {
+            BlockPos nextPathPos = preparedLoadTarget.fallbackPathPositions().get(0);
+            List<BlockPos> remainingFallbacks = preparedLoadTarget.fallbackPathPositions().size() > 1
+                    ? new ArrayList<>(preparedLoadTarget.fallbackPathPositions().subList(1, preparedLoadTarget.fallbackPathPositions().size()))
+                    : List.of();
+            return Optional.of(new PreparedLoadTarget(
+                    preparedLoadTarget.clickPos(),
+                    nextPathPos,
+                    preparedLoadTarget.pathBeforeClick(),
+                    remainingFallbacks,
+                    preparedLoadTarget.refreshAttempt()
+            ));
+        }
+
+        if (preparedLoadTarget.refreshAttempt() >= MAX_PREPARED_TARGET_REFRESHES) {
+            return Optional.empty();
+        }
+
+        info("Refreshing prepared load target for pearl " + pearl.pearlId + " after path failure");
+        return prepareLoadTarget(pearl, preparedLoadTarget.refreshAttempt() + 1);
+    }
+
+    private void attemptPreparedLoad(PearlPlusConfig.StoredPearl pearl, PreparedLoadTarget preparedLoadTarget, String requesterName, BlockPos startPos) {
+        if (preparedLoadTarget == null) {
+            notifier.discordAndIngameNotification(Embed.builder()
+                    .title("Can't Load Pearl")
+                    .description("Unable to prepare a load target")
+                    .errorColor());
+            return;
+        }
+
         if (!preparedLoadTarget.pathBeforeClick()) {
             triggerPreparedLoad(preparedLoadTarget, pearl, requesterName, startPos);
             return;
         }
 
-        BARITONE.pathTo((int) preparedLoadTarget.pathPos().x(), (int) preparedLoadTarget.pathPos().z())
-                .addExecutedListener(pathFuture -> triggerPreparedLoad(preparedLoadTarget, pearl, requesterName, startPos));
+        BARITONE.pathTo((int) preparedLoadTarget.pathPos().x(), (int) preparedLoadTarget.pathPos().y(), (int) preparedLoadTarget.pathPos().z())
+                .addExecutedListener(pathFuture -> onPreparedLoadPathComplete(pearl, preparedLoadTarget, requesterName, startPos));
+    }
+
+    private void onPreparedLoadPathComplete(PearlPlusConfig.StoredPearl pearl, PreparedLoadTarget preparedLoadTarget, String requesterName, BlockPos startPos) {
+        if (!isNearPreparedLoadTarget(preparedLoadTarget, PATH_ARRIVAL_DISTANCE_BLOCKS)) {
+            retryPreparedLoadOrFail(pearl, preparedLoadTarget, requesterName, startPos,
+                    "I couldn't get into position for pearl " + pearl.pearlId + ".");
+            return;
+        }
+
+        if (!isClickTargetReachableFromCurrentPosition(preparedLoadTarget)) {
+            retryPreparedLoadOrFail(pearl, preparedLoadTarget, requesterName, startPos,
+                    unreachableClickTargetMessage(preparedLoadTarget, pearl));
+            return;
+        }
+
+        triggerPreparedLoad(preparedLoadTarget, pearl, requesterName, startPos);
+    }
+
+    private void retryPreparedLoadOrFail(
+            PearlPlusConfig.StoredPearl pearl,
+            PreparedLoadTarget preparedLoadTarget,
+            String requesterName,
+            BlockPos startPos,
+            String failureReason
+    ) {
+        Optional<PreparedLoadTarget> nextTarget = advancePreparedLoadTarget(pearl, preparedLoadTarget);
+        if (nextTarget.isPresent()) {
+            PreparedLoadTarget retryTarget = nextTarget.get();
+            info("Retrying pearl " + pearl.pearlId + " from alternate stand position [" +
+                    retryTarget.pathPos().x() + ", " + retryTarget.pathPos().y() + ", " + retryTarget.pathPos().z() +
+                    "] after failure: " + failureReason);
+            attemptPreparedLoad(pearl, retryTarget, requesterName, startPos);
+            return;
+        }
+
+        LOG.warn(failureReason);
+        notifier.discordAndIngameNotification(Embed.builder()
+                .title("Can't Load Pearl")
+                .description(failureReason)
+                .errorColor());
+    }
+
+    private int scoreTrapdoorCandidate(int pearlX, int pearlY, int pearlZ, int trapdoorX, int trapdoorY, int trapdoorZ) {
+        int dx = Math.abs(trapdoorX - pearlX);
+        int dy = Math.abs(trapdoorY - pearlY);
+        int dz = Math.abs(trapdoorZ - pearlZ);
+        int horizontalManhattan = dx + dz;
+        int score = dx * dx + dy * dy + dz * dz;
+
+        if (horizontalManhattan == 0) {
+            score -= 24;
+        } else if (horizontalManhattan == 1) {
+            score -= 8;
+        } else {
+            score += horizontalManhattan * 4;
+        }
+
+        score += dy * 6;
+        return score;
+    }
+
+    private boolean isStandPositionValid(Object chunkCache, int x, int feetY, int z) {
+        String supportName = blockNameAt(chunkCache, x, feetY - 1, z);
+        if (!isUsableSupportBlock(supportName)) {
+            return false;
+        }
+
+        String feetName = blockNameAt(chunkCache, x, feetY, z);
+        if (!isPassableOccupantBlock(feetName)) {
+            return false;
+        }
+
+        String headName = blockNameAt(chunkCache, x, feetY + 1, z);
+        return isPassableOccupantBlock(headName);
+    }
+
+    private String blockNameAt(Object chunkCacheObj, int x, int y, int z) {
+        if (chunkCacheObj == null) {
+            return null;
+        }
+        var chunkCache = CACHE.getChunkCache();
+        if (chunkCache == null) {
+            return null;
+        }
+        var section = chunkCache.getChunkSection(x, y, z);
+        if (section == null) {
+            return null;
+        }
+
+        int stateId = section.getBlock(x & 15, y & 15, z & 15);
+        if (stateId == 0) {
+            return "minecraft:air";
+        }
+
+        var block = BLOCK_DATA.getBlockDataFromBlockStateId(stateId);
+        return block != null ? block.name() : null;
+    }
+
+    private boolean isUsableSupportBlock(String blockName) {
+        if (blockName == null || blockName.contains("air")) {
+            return false;
+        }
+
+        return !(blockName.contains("water")
+                || blockName.contains("lava")
+                || blockName.endsWith("_trapdoor")
+                || blockName.contains("ladder")
+                || blockName.contains("vine")
+                || blockName.contains("scaffolding"));
+    }
+
+    private boolean isPassableOccupantBlock(String blockName) {
+        if (blockName == null) {
+            return false;
+        }
+
+        if (blockName.contains("air")) {
+            return true;
+        }
+
+        return blockName.endsWith("_sign")
+                || blockName.contains("hanging_sign")
+                || blockName.contains("button")
+                || blockName.contains("tripwire")
+                || blockName.contains("lever")
+                || blockName.contains("torch")
+                || blockName.endsWith("_rail")
+                || "minecraft:rail".equals(blockName);
+    }
+
+    private boolean canReachClickTargetFromPosition(BlockPos standPos, BlockPos clickPos, double maxDistance) {
+        if (standPos == null || clickPos == null) {
+            return false;
+        }
+
+        double eyeX = standPos.x() + 0.5D;
+        double eyeY = standPos.y() + 1.62D;
+        double eyeZ = standPos.z() + 0.5D;
+
+        double targetX = clickPos.x() + 0.5D;
+        double targetY = clickPos.y() + 0.5D;
+        double targetZ = clickPos.z() + 0.5D;
+
+        double dx = eyeX - targetX;
+        double dy = eyeY - targetY;
+        double dz = eyeZ - targetZ;
+        return Math.sqrt(dx * dx + dy * dy + dz * dz) <= maxDistance;
+    }
+
+    private String formatBlockPos(BlockPos pos) {
+        if (pos == null) {
+            return "unknown";
+        }
+        return "[" + pos.x() + ", " + pos.y() + ", " + pos.z() + "]";
+    }
+
+    private record TrapdoorCandidate(BlockPos pos, int score) {
     }
 
     public String pearlsList(UUID ownerUuid) {

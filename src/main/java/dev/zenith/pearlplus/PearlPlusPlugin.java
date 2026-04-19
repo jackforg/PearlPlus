@@ -11,8 +11,8 @@ import dev.zenith.pearlplus.module.*;
     id = BuildConstants.PLUGIN_ID,
     version = BuildConstants.VERSION,
     description = "Slightly better pearl loading module.",
-    url = "https://github.com/duccss/pearlplus/",
-    authors = {"duccss", "steve2b2t", "Leotonic"},
+    url = "https://github.com/jackforg/PearlPlus/",
+    authors = {"duccss", "steve2b2t", "Leotonic", "jackforg"},
     mcVersions = "*" // mark every version compatible
 )
 
