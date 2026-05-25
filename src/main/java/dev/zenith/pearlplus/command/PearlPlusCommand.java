@@ -41,6 +41,7 @@ public class PearlPlusCommand extends Command {
                 "load <playerName> <pearlId>",
                 "returnpos <on/off>",
                 "strict <on/off>",
+                "loadcommand <word>",
                 "autodetect <on/off>",
                 "autodetect temp <on/off>",
                 "distancecheck <on/off>",
@@ -123,7 +124,7 @@ public class PearlPlusCommand extends Command {
                                                     manager.recordPearl(uuid, name, pearlId, x, y, z);
                                                     c.getSource().getEmbed()
                                                             .title("Pearl stored for " + name)
-                                                            .description(String.format("%s at %d %d %d", pearlId, x, y, z));
+                                                            .description(String.format("%s at ||%d %d %d||", pearlId, x, y, z));
                                                     return 0;
                                                 })))))));
 
@@ -195,6 +196,18 @@ public class PearlPlusCommand extends Command {
                         PLUGIN_CONFIG.defaultPearlId = word;
                         c.getSource().getEmbed().title("Pearl ID word set to '" + word + "'");
                     }
+                    return 0;
+                })));
+
+        builder.then(literal("loadcommand")
+                .then(argument("word", wordWithChars()).executes(c -> {
+                    String word = getString(c, "word").trim();
+                    if (word.isEmpty()) {
+                        c.getSource().getEmbed().title("Load trigger word cannot be empty");
+                        return 0;
+                    }
+                    PLUGIN_CONFIG.autoLoad.loadCommand = word;
+                    c.getSource().getEmbed().title("Load trigger word set to '" + word + "'");
                     return 0;
                 })));
 
@@ -493,6 +506,7 @@ public class PearlPlusCommand extends Command {
                 .addField("Default Pearl ID", defaultPearlId)
                 .addField("Return Position", toggleStr(PLUGIN_CONFIG.autoLoad.returnToStartPos))
                 .addField("Strict", toggleStr(!PLUGIN_CONFIG.autoLoad.allowNoiseAfterPearl))
+                .addField("Load Command", loadCommand())
                 .addField("Autodetect", toggleStr(PLUGIN_CONFIG.autoDetect.enabled))
                 .addField("Autodetect Temp", toggleStr(PLUGIN_CONFIG.autoDetect.temporaryMode))
                 .addField("Distance Check", toggleStr(PLUGIN_CONFIG.autoDetect.distanceCheck))
@@ -509,8 +523,54 @@ public class PearlPlusCommand extends Command {
     }
 
     private UUID resolveUuidByUsername(final String username) {
-        return PlayerListsManager.getProfileFromUsername(username)
+        String sanitizedUsername = sanitizeUsername(username);
+        if (sanitizedUsername == null) {
+            return null;
+        }
+
+        UUID configuredUuid = resolveConfiguredPlayerUuid(sanitizedUsername);
+        if (configuredUuid != null) {
+            return configuredUuid;
+        }
+
+        return PlayerListsManager.getProfileFromUsername(sanitizedUsername)
                 .map(profile -> profile.uuid())
                 .orElse(null);
+    }
+
+    private String loadCommand() {
+        String configured = PLUGIN_CONFIG.autoLoad.loadCommand;
+        if (configured == null || configured.isBlank()) {
+            return "load";
+        }
+        return configured.trim();
+    }
+
+    private UUID resolveConfiguredPlayerUuid(final String username) {
+        return PLUGIN_CONFIG.players.entrySet().stream()
+                .filter(entry -> entry.getValue() != null && entry.getValue().playerName != null)
+                .filter(entry -> entry.getValue().playerName.equalsIgnoreCase(username))
+                .map(java.util.Map.Entry::getKey)
+                .findFirst()
+                .orElseGet(() -> PLUGIN_CONFIG.whitelist.entrySet().stream()
+                        .filter(entry -> entry.getValue() != null && entry.getValue().username != null)
+                        .filter(entry -> entry.getValue().username.equalsIgnoreCase(username))
+                        .map(java.util.Map.Entry::getKey)
+                        .findFirst()
+                        .orElse(null));
+    }
+
+    private String sanitizeUsername(final String username) {
+        if (username == null) {
+            return null;
+        }
+
+        String sanitized = username
+                .replace("\u200B", "")
+                .replace("\u200C", "")
+                .replace("\u200D", "")
+                .replace("\uFEFF", "")
+                .strip();
+        return sanitized.isEmpty() ? null : sanitized;
     }
 }

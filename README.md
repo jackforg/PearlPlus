@@ -3,7 +3,14 @@
 PearlPlus automatically detects new stasis pearls and registers them with its own pearl loader. Pearl throwers can then load these pearls through chat whispers.
 The config is saved to `plugins/config/pearlplus.json`
 
-In Zenith run `plugins download https://github.com/duccss/PearlPlus/releases/download/2.0.9/PearlPlus-2.0.9.jar` or download the [lastest build](https://github.com/duccss/PearlPlus/releases/latest) and place the jar file in your proxy's plugin folder.
+This fork lives at [jackforg/PearlPlus](https://github.com/jackforg/PearlPlus).
+
+### Credits
+
+- Original authors: `duccss`, `steve2b2t`, `Leotonic`
+- Current fork and ongoing feature work: `jackforg`
+
+In Zenith run `plugins download <release-asset-url>` from this repo's releases or download the [latest build](https://github.com/jackforg/PearlPlus/releases/latest) and place the jar file in your proxy's plugin folder.
 
 This plugin **WILL NOT WORK** unless a correct `chatschema` is set in Zenith. Most vanilla servers like 2b2t and Constantiam don't require you to set one but other servers with custom whisper builders for example 9b9t will need one. Please check the wiki [here](https://wiki.2b2t.vc/Commands/#chatschema).
 You might also need to set the whisper command for the server you're playing on using `extraChat whisperCommand <command>` to allow the bot to whisper back.
@@ -38,6 +45,11 @@ pearlplus autodefault <on/off>
 ```bash
 pearlplus strict <on/off>
 ```
+```bash
+pearlplus loadcommand <word>
+```
+Sets the in-game whisper trigger used by normal pearl loads. The default is `load`.
+
 ```bash
 pearlplus autodetect <on/off>
 ```
@@ -88,6 +100,8 @@ There are a few in-game commands players can whisper to the bot to manage their 
 `default PearlID` sets that pearl as default if `autodefault` disabled.
 
 `bind CODE` links the whispering Minecraft account to a Discord user who requested a link code.
+
+`<loadCommand> optionalPearlID` loads your pearl through whispers. The default load command is `load`, and staff can change it with `pp loadcommand <word>`.
 
 ### Discord Offline Load
 
@@ -168,9 +182,9 @@ Using a Discord user ID is recommended. Username matching is supported for conve
 
 ### Usage
 
-Simply throw a new ender pearl and once it becomes stable the bot will register it, setting the pearlID as "Base" by default with an incrementing number for subsequent pearls. That player can now whisper `load` to the zenith bot and the bot will load the pearl. Players with multiple pearls can add the pearlID after `load` to have a specific pearl loaded. Players will receive a warning whisper when loading a stasis chamber where a pearl isn't detected.
+Simply throw a new ender pearl and once it becomes stable the bot will register it, setting the pearlID as "Base" by default with an incrementing number for subsequent pearls. That player can now whisper the configured load command to the zenith bot and the bot will load the pearl. Players with multiple pearls can add the pearlID after the load command to have a specific pearl loaded. Players will receive a warning whisper when loading a stasis chamber where a pearl isn't detected.
 ```bash
-/w <botName> load <optionalID> 
+/w <botName> <loadCommand> <optionalID>
 ```
 By default, when a player doesn't specify which pearl they want loaded the bot will load whatever one where a pearl is detected. Can be disabled with `pp autodefault off`
 
@@ -185,7 +199,9 @@ Use the `pp add/del` commands to set up manually.
 
 By default, the bot resolves the username of pearl throwers with entity ID's. Some servers might not allow this so if the bot is unable to register pearls automatically use `pp distancecheck on`. This will get the throwers name from the closest player to the pearl. 2b2t players have reported autodetect ceasing to work occasionally. Always test before enabling this feature.
 
-By default, you can add a random word after `load` or the `pearlID` to get around anti-spam. This can be disabled using `pp strict on`.
+PearlPlus now also captures pearl spawn ownership at packet time and can register from the thrower's UUID before their name resolves, which makes the default owner-id path more reliable on laggy servers like 2b2t.
+
+By default, you can add a random word after the load command or the `pearlID` to get around anti-spam. This can be disabled using `pp strict on`.
 
 #### Recommended Zenith settings
 

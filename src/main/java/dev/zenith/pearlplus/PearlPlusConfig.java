@@ -23,6 +23,7 @@ public class PearlPlusConfig {
         public boolean autoDefaultToPresent = true;
         public boolean whitelistEnabled = false;
         public boolean dropPearlAfterLoad = true;
+        public String loadCommand = "load";
     }
 
     public static final class AutoDetectConfig {

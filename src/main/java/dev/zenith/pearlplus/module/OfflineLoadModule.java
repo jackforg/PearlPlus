@@ -5,12 +5,19 @@ import com.zenith.discord.Embed;
 import com.zenith.event.chat.WhisperChatEvent;
 import com.zenith.event.client.ClientBotTick;
 import com.zenith.event.message.DiscordMainChannelCommandReceivedEvent;
+import com.zenith.event.server.ServerPlayerConnectedEvent;
 import com.zenith.mc.block.BlockPos;
 import com.zenith.module.api.Module;
+import com.zenith.network.codec.PacketHandlerCodec;
+import com.zenith.network.codec.PacketHandlerStateCodec;
 import com.zenith.util.ChatUtil;
 import dev.zenith.pearlplus.PearlPlusConfig;
+import dev.zenith.pearlplus.event.ImmediatePlayerInfoAddEvent;
+import dev.zenith.pearlplus.feature.offlineload.OfflineLoadPlayerInfoUpdateHandler;
 import net.dv8tion.jda.api.events.message.MessageReceivedEvent;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
+import org.geysermc.mcprotocollib.protocol.data.ProtocolState;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundPlayerInfoUpdatePacket;
 
 import java.security.SecureRandom;
 import java.util.ArrayList;
@@ -20,6 +27,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 import static com.github.rfresh2.EventConsumer.of;
@@ -57,8 +65,21 @@ public class OfflineLoadModule extends Module {
         return List.of(
                 of(WhisperChatEvent.class, this::onWhisper),
                 of(DiscordMainChannelCommandReceivedEvent.class, this::onDiscordCommand),
+                of(ImmediatePlayerInfoAddEvent.class, this::onImmediatePlayerInfoAdd),
+                of(ServerPlayerConnectedEvent.class, this::onServerPlayerConnected),
                 of(ClientBotTick.class, event -> onTick())
         );
+    }
+
+    @Override
+    public PacketHandlerCodec registerClientPacketHandlerCodec() {
+        return PacketHandlerCodec.clientBuilder()
+                .setId("pearlplus-offline-immediate-player-info")
+                .setPriority(100)
+                .state(ProtocolState.GAME, PacketHandlerStateCodec.clientBuilder()
+                        .inbound(ClientboundPlayerInfoUpdatePacket.class, new OfflineLoadPlayerInfoUpdateHandler())
+                        .build())
+                .build();
     }
 
     @Override
@@ -213,8 +234,42 @@ public class OfflineLoadModule extends Module {
         }
 
         if (isPlayerOnline(request.playerUuid, request.playerName)) {
-            triggerActiveRequest(request);
+            triggerActiveRequest(request, "tablist-poll", now);
         }
+    }
+
+    private void onImmediatePlayerInfoAdd(ImmediatePlayerInfoAddEvent event) {
+        StagedOfflineLoad request;
+        synchronized (this) {
+            request = activeRequest;
+        }
+
+        if (request == null || !request.armed || event == null) {
+            return;
+        }
+
+        if (!matchesActiveRequest(event, request)) {
+            return;
+        }
+
+        triggerActiveRequest(request, "player-info-add", event.detectedAt());
+    }
+
+    private void onServerPlayerConnected(ServerPlayerConnectedEvent event) {
+        StagedOfflineLoad request;
+        synchronized (this) {
+            request = activeRequest;
+        }
+
+        if (request == null || !request.armed || event == null || event.playerEntry() == null) {
+            return;
+        }
+
+        if (!matchesActiveRequest(event, request)) {
+            return;
+        }
+
+        triggerActiveRequest(request, "server-player-connected", System.currentTimeMillis());
     }
 
     private boolean handleDiscordMessage(MessageReceivedEvent event, String rawMessage) {
@@ -421,8 +476,7 @@ public class OfflineLoadModule extends Module {
                 .addField("Pearl", pearl.pearlId)
                 .primaryColor());
 
-        BARITONE.pathTo((int) preparedLoadTarget.pathPos().x(), (int) preparedLoadTarget.pathPos().z())
-                .addExecutedListener(future -> onStagePathComplete(request));
+        pathOfflineRequest(request);
     }
 
     private void handleOfflineCancel(MessageReceivedEvent event) {
@@ -473,8 +527,22 @@ public class OfflineLoadModule extends Module {
         }
 
         if (!pearlManager.isNearPreparedLoadTarget(request.preparedLoadTarget, READY_DISTANCE_BLOCKS)) {
+            if (retryOfflinePreparedTarget(request, "I couldn't get into position for the offline load.")) {
+                return;
+            }
             clearActiveRequest(request, "I couldn't get into position for the offline load.", true);
             sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " I couldn't get into position for `" + request.pearl.pearlId + "`.");
+            return;
+        }
+
+        if (!pearlManager.isClickTargetReachableFromCurrentPosition(request.preparedLoadTarget)) {
+            String reason = pearlManager.unreachableClickTargetMessage(request.preparedLoadTarget, request.pearl);
+            LOG.warn(reason);
+            if (retryOfflinePreparedTarget(request, reason)) {
+                return;
+            }
+            clearActiveRequest(request, reason, true);
+            sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " " + reason);
             return;
         }
 
@@ -483,7 +551,16 @@ public class OfflineLoadModule extends Module {
                 return;
             }
             request.armed = true;
-            request.expiresAt = System.currentTimeMillis() + readyWindowMs();
+            request.armedAt = System.currentTimeMillis();
+            request.expiresAt = request.armedAt + readyWindowMs();
+            request.onlineDetectedAt = 0L;
+            request.activationStartedAt = 0L;
+            request.activationTriggerSource = null;
+        }
+
+        if (isPlayerOnline(request.playerUuid, request.playerName)) {
+            triggerActiveRequest(request, "already-online-when-armed", request.armedAt);
+            return;
         }
 
         sendChannelMessage(
@@ -503,15 +580,20 @@ public class OfflineLoadModule extends Module {
         sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " the offline load window for `" + request.pearl.pearlId + "` expired.");
     }
 
-    private void triggerActiveRequest(StagedOfflineLoad request) {
+    private void triggerActiveRequest(StagedOfflineLoad request, String triggerSource, long detectedOnlineAt) {
+        long triggerStartedAt = System.currentTimeMillis();
         synchronized (this) {
             if (activeRequest != request) {
                 return;
             }
+            if (request.activationStartedAt > 0L) {
+                return;
+            }
+            request.onlineDetectedAt = detectedOnlineAt;
+            request.activationStartedAt = triggerStartedAt;
+            request.activationTriggerSource = triggerSource;
             activeRequest = null;
         }
-
-        sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " detected `" + request.playerName + "` online. Activating `" + request.pearl.pearlId + "` now.");
 
         String blocker = pearlManager.validateCanLoad();
         if (blocker != null) {
@@ -526,7 +608,64 @@ public class OfflineLoadModule extends Module {
             return;
         }
 
+        if (!pearlManager.isClickTargetReachableFromCurrentPosition(request.preparedLoadTarget)) {
+            String reason = pearlManager.unreachableClickTargetMessage(request.preparedLoadTarget, request.pearl);
+            LOG.warn(reason);
+            sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " " + reason);
+            returnToStartPosition(request.startPos);
+            return;
+        }
+
+        long armedToOnlineDetectMs = request.armedAt > 0L && request.onlineDetectedAt > 0L
+                ? Math.max(0L, request.onlineDetectedAt - request.armedAt)
+                : -1L;
+        long onlineDetectToTriggerStartMs = request.onlineDetectedAt > 0L
+                ? Math.max(0L, request.activationStartedAt - request.onlineDetectedAt)
+                : -1L;
+        long armedToTriggerStartMs = request.armedAt > 0L
+                ? Math.max(0L, request.activationStartedAt - request.armedAt)
+                : -1L;
+        LOG.info("Activating offline load for {} / {} via {}{}{}{}",
+                request.playerName,
+                request.pearl.pearlId,
+                request.activationTriggerSource,
+                armedToOnlineDetectMs >= 0L ? " after " + armedToOnlineDetectMs + "ms to online-detect" : "",
+                onlineDetectToTriggerStartMs >= 0L ? ", " + onlineDetectToTriggerStartMs + "ms detect-to-trigger" : "",
+                armedToTriggerStartMs >= 0L ? ", " + armedToTriggerStartMs + "ms armed-to-trigger" : "");
         pearlManager.triggerPreparedLoad(request.preparedLoadTarget, request.pearl, request.playerName, request.startPos);
+        sendChannelMessage(request.sourceEvent,
+                mention(request.discordUserId) + " detected `" + request.playerName + "` online. Activating `" + request.pearl.pearlId + "` now.");
+    }
+
+    private void pathOfflineRequest(StagedOfflineLoad request) {
+        PearlManager.PreparedLoadTarget preparedLoadTarget = request.preparedLoadTarget;
+        if (preparedLoadTarget == null) {
+            clearActiveRequest(request, "I couldn't prepare a click target for the offline load.", true);
+            sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " I couldn't prepare a click target for `" + request.pearl.pearlId + "`.");
+            return;
+        }
+
+        BARITONE.pathTo((int) preparedLoadTarget.pathPos().x(), (int) preparedLoadTarget.pathPos().y(), (int) preparedLoadTarget.pathPos().z())
+                .addExecutedListener(future -> onStagePathComplete(request));
+    }
+
+    private boolean retryOfflinePreparedTarget(StagedOfflineLoad request, String failureReason) {
+        Optional<PearlManager.PreparedLoadTarget> nextTarget = pearlManager.advancePreparedLoadTarget(request.pearl, request.preparedLoadTarget);
+        if (nextTarget.isEmpty()) {
+            return false;
+        }
+
+        request.preparedLoadTarget = nextTarget.get();
+        PearlManager.PreparedLoadTarget retryTarget = request.preparedLoadTarget;
+        LOG.info("Retrying offline load for {} / {} from alternate stand position [{}, {}, {}] after failure: {}",
+                request.playerName,
+                request.pearl.pearlId,
+                retryTarget.pathPos().x(),
+                retryTarget.pathPos().y(),
+                retryTarget.pathPos().z(),
+                failureReason);
+        pathOfflineRequest(request);
+        return true;
     }
 
     private synchronized void clearActiveRequest(StagedOfflineLoad request, String reason, boolean returnToStart) {
@@ -562,6 +701,21 @@ public class OfflineLoadModule extends Module {
             return true;
         }
         return playerName != null && CACHE.getTabListCache().getFromName(playerName).isPresent();
+    }
+
+    private boolean matchesActiveRequest(ServerPlayerConnectedEvent event, StagedOfflineLoad request) {
+        if (request.playerUuid != null && request.playerUuid.equals(event.playerEntry().getProfileId())) {
+            return true;
+        }
+        return request.playerName != null
+                && event.playerEntry().getName() != null
+                && request.playerName.equalsIgnoreCase(event.playerEntry().getName());
+    }
+
+    private boolean matchesActiveRequest(ImmediatePlayerInfoAddEvent event, StagedOfflineLoad request) {
+        return request.playerUuid != null
+                && event.playerUuid() != null
+                && request.playerUuid.equals(event.playerUuid());
     }
 
     private void replyToDiscord(MessageReceivedEvent event, String message) {
@@ -893,9 +1047,13 @@ public class OfflineLoadModule extends Module {
         private final UUID playerUuid;
         private final String playerName;
         private final PearlPlusConfig.StoredPearl pearl;
-        private final PearlManager.PreparedLoadTarget preparedLoadTarget;
+        private PearlManager.PreparedLoadTarget preparedLoadTarget;
         private final BlockPos startPos;
         private boolean armed;
+        private long armedAt;
+        private long onlineDetectedAt;
+        private long activationStartedAt;
+        private String activationTriggerSource;
         private long expiresAt;
 
         private StagedOfflineLoad(
