@@ -46,6 +46,11 @@ pearlplus autodefault <on/off>
 pearlplus strict <on/off>
 ```
 ```bash
+pearlplus loadcommand <word>
+```
+Sets the in-game whisper trigger used by normal pearl loads. The default is `load`.
+
+```bash
 pearlplus autodetect <on/off>
 ```
 ```bash
@@ -95,6 +100,8 @@ There are a few in-game commands players can whisper to the bot to manage their 
 `default PearlID` sets that pearl as default if `autodefault` disabled.
 
 `bind CODE` links the whispering Minecraft account to a Discord user who requested a link code.
+
+`<loadCommand> optionalPearlID` loads your pearl through whispers. The default load command is `load`, and staff can change it with `pp loadcommand <word>`.
 
 ### Discord Offline Load
 
@@ -175,9 +182,9 @@ Using a Discord user ID is recommended. Username matching is supported for conve
 
 ### Usage
 
-Simply throw a new ender pearl and once it becomes stable the bot will register it, setting the pearlID as "Base" by default with an incrementing number for subsequent pearls. That player can now whisper `load` to the zenith bot and the bot will load the pearl. Players with multiple pearls can add the pearlID after `load` to have a specific pearl loaded. Players will receive a warning whisper when loading a stasis chamber where a pearl isn't detected.
+Simply throw a new ender pearl and once it becomes stable the bot will register it, setting the pearlID as "Base" by default with an incrementing number for subsequent pearls. That player can now whisper the configured load command to the zenith bot and the bot will load the pearl. Players with multiple pearls can add the pearlID after the load command to have a specific pearl loaded. Players will receive a warning whisper when loading a stasis chamber where a pearl isn't detected.
 ```bash
-/w <botName> load <optionalID> 
+/w <botName> <loadCommand> <optionalID>
 ```
 By default, when a player doesn't specify which pearl they want loaded the bot will load whatever one where a pearl is detected. Can be disabled with `pp autodefault off`
 
@@ -194,7 +201,7 @@ By default, the bot resolves the username of pearl throwers with entity ID's. So
 
 PearlPlus now also captures pearl spawn ownership at packet time and can register from the thrower's UUID before their name resolves, which makes the default owner-id path more reliable on laggy servers like 2b2t.
 
-By default, you can add a random word after `load` or the `pearlID` to get around anti-spam. This can be disabled using `pp strict on`.
+By default, you can add a random word after the load command or the `pearlID` to get around anti-spam. This can be disabled using `pp strict on`.
 
 #### Recommended Zenith settings
 

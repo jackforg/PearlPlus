@@ -370,7 +370,7 @@ public class AutoDetectModule extends Module {
         }
 
         String message = determineBotName()
-                .map(botName -> String.format("Pearl Registered. Load me with /w %s load %s", botName, pearlId))
+                .map(botName -> String.format("Pearl Registered. Load me with /w %s %s %s", botName, loadCommand(), pearlId))
                 .orElse(String.format("Pearl Registered as %s.", pearlId));
         sendClientPacketAsync(ChatUtil.getWhisperChatPacket(ownerName, message));
         info(String.format(
@@ -392,7 +392,7 @@ public class AutoDetectModule extends Module {
                 .title("Pearl Registered")
                 .addField("Pearl", pearlId)
                 .addField("Owner", ownerSummary)
-                .addField("Position", String.format("%d %d %d", position.x(), position.y(), position.z()))
+                .addField("Position", String.format("||%d %d %d||", position.x(), position.y(), position.z()))
         );
     }
 
@@ -784,7 +784,7 @@ public class AutoDetectModule extends Module {
                 .title("Pearl Removal Warning")
                 .addField("Owner", trackedPearl.ownerSummary())
                 .addField("Pearl", trackedPearl.pearlId() == null ? "unknown" : trackedPearl.pearlId())
-                .addField("Position", String.format("%d %d %d", trackedPearl.blockX(), trackedPearl.blockY(), trackedPearl.blockZ()));
+                .addField("Position", String.format("||%d %d %d||", trackedPearl.blockX(), trackedPearl.blockY(), trackedPearl.blockZ()));
         discordAndIngameNotification(builder);
     }
 
@@ -812,6 +812,14 @@ public class AutoDetectModule extends Module {
     }
 
     private record Column(int x, int z) { }
+
+    private String loadCommand() {
+        String configured = PLUGIN_CONFIG.autoLoad.loadCommand;
+        if (configured == null || configured.isBlank()) {
+            return "load";
+        }
+        return configured.trim();
+    }
 
     private record OwnerInfo(UUID uuid, String name) {
         boolean hasName() {

@@ -6,6 +6,7 @@ import com.zenith.module.api.Module;
 import com.zenith.util.ChatUtil;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 
 import static com.github.rfresh2.EventConsumer.of;
@@ -37,9 +38,10 @@ public class AutoLoadModule extends Module {
         var sender = event.sender();
         String name = sender.getName();
         UUID uuid = sender.getProfileId();
+        String loadCommand = loadCommand();
 
         // Check whitelist for load commands
-        if (msg.startsWith("load")) {
+        if (lowerParts.length > 0 && loadCommand.equals(lowerParts[0])) {
             if (PLUGIN_CONFIG.autoLoad.whitelistEnabled && !PLUGIN_CONFIG.whitelist.containsKey(uuid)) {
                 // Non-whitelisted player trying to load - ignore silently
                 return;
@@ -106,7 +108,7 @@ public class AutoLoadModule extends Module {
             return;
         }
 
-        if (!msg.startsWith("load")) return;
+        if (lowerParts.length == 0 || !loadCommand.equals(lowerParts[0])) return;
 
         var playerEntry = PLUGIN_CONFIG.players.get(uuid);
         if (playerEntry == null || playerEntry.pearls.isEmpty()) {
@@ -178,5 +180,13 @@ public class AutoLoadModule extends Module {
 
         pearlManager.loadPearl(pearl, name);
         
+    }
+
+    private String loadCommand() {
+        String configured = PLUGIN_CONFIG.autoLoad.loadCommand;
+        if (configured == null || configured.isBlank()) {
+            return "load";
+        }
+        return configured.trim().toLowerCase(Locale.ROOT);
     }
 }
