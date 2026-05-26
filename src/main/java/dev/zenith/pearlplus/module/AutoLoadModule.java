@@ -7,6 +7,7 @@ import com.zenith.util.ChatUtil;
 
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 
 import static com.github.rfresh2.EventConsumer.of;
@@ -14,6 +15,8 @@ import static com.zenith.Globals.*;
 import static dev.zenith.pearlplus.PearlPlusPlugin.PLUGIN_CONFIG;
 
 public class AutoLoadModule extends Module {
+    private static final Set<String> BUILT_IN_LOAD_ALIASES = Set.of("tp", "pearl", "pull");
+
     private final PearlManager pearlManager = new PearlManager(this);
 
     @Override
@@ -38,10 +41,9 @@ public class AutoLoadModule extends Module {
         var sender = event.sender();
         String name = sender.getName();
         UUID uuid = sender.getProfileId();
-        String loadCommand = loadCommand();
 
         // Check whitelist for load commands
-        if (lowerParts.length > 0 && loadCommand.equals(lowerParts[0])) {
+        if (lowerParts.length > 0 && isLoadCommandToken(lowerParts[0])) {
             if (PLUGIN_CONFIG.autoLoad.whitelistEnabled && !PLUGIN_CONFIG.whitelist.containsKey(uuid)) {
                 // Non-whitelisted player trying to load - ignore silently
                 return;
@@ -108,7 +110,7 @@ public class AutoLoadModule extends Module {
             return;
         }
 
-        if (lowerParts.length == 0 || !loadCommand.equals(lowerParts[0])) return;
+        if (lowerParts.length == 0 || !isLoadCommandToken(lowerParts[0])) return;
 
         var playerEntry = PLUGIN_CONFIG.players.get(uuid);
         if (playerEntry == null || playerEntry.pearls.isEmpty()) {
@@ -162,20 +164,26 @@ public class AutoLoadModule extends Module {
                 .addField("Pearl", requestedPearl)
         );
 
-        // Check the amount of pearls left for the user. Subtract one since the pearl will be pulled after.
-        int PearlsLeft = pearlManager.countPresentPearls(uuid)-1;
+        boolean requestedPearlPresent = pearlManager.isPearlPresent(pearl);
+        int presentPearls = pearlManager.countPresentPearls(uuid);
+        int pearlsAfterLoad = Math.max(0, presentPearls - 1);
 
-        // Set the default sentence to send.
-        String pearlFeedback = "You have " + PearlsLeft + " pearls left.";
+        info("Pearl count for " + name + ": present=" + presentPearls
+                + ", afterLoad=" + pearlsAfterLoad
+                + ", requestedPresent=" + requestedPearlPresent);
 
-        if(PearlsLeft == 1){
-            pearlFeedback = "Don't forget to drop down a new pearl, this is your last one!";
+        String pearlFeedback = "You will have " + pearlsAfterLoad + " "
+                + (pearlsAfterLoad == 1 ? "pearl" : "pearls")
+                + " left after this load.";
+
+        if (requestedPearlPresent && presentPearls <= 1) {
+            pearlFeedback = "This is your last pearl. Please drop a new one after loading.";
         }
 
-        if (!pearlManager.isPearlPresent(pearl)) {
-            sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "No pearl detected. Attempting to load anyways."));
+        if (!requestedPearlPresent) {
+            sendClientPacketAwait(ChatUtil.getWhisperChatPacket(name, "No pearl detected. Attempting to load anyways."));
         }else{
-            sendClientPacketAsync(ChatUtil.getWhisperChatPacket(name, "Loading pearl " + requestedPearl + "... "+pearlFeedback));
+            sendClientPacketAwait(ChatUtil.getWhisperChatPacket(name, "Loading pearl " + requestedPearl + "... " + pearlFeedback));
         }
 
         pearlManager.loadPearl(pearl, name);
@@ -188,5 +196,22 @@ public class AutoLoadModule extends Module {
             return "load";
         }
         return configured.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private boolean isLoadCommandToken(String token) {
+        String normalized = normalizeLoadCommandToken(token);
+        return loadCommand().equals(normalized) || BUILT_IN_LOAD_ALIASES.contains(normalized);
+    }
+
+    private String normalizeLoadCommandToken(String token) {
+        if (token == null) {
+            return "";
+        }
+
+        String normalized = token.trim().toLowerCase(Locale.ROOT);
+        if (normalized.startsWith("!")) {
+            normalized = normalized.substring(1);
+        }
+        return normalized;
     }
 }
