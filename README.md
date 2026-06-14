@@ -115,6 +115,11 @@ Players can stage a pearl from Discord while offline, then log in during a 2 min
 
 Additional Discord commands:
 
+`.pp controls` or `.pp offline controls` posts a user-locked button panel using
+the current linked accounts and stored pearls. Refresh rebuilds the panel from
+live config, and the load, status, and cancel buttons continue working after a
+ZenithProxy restart.
+
 `pp offline status` shows whether a staged offline load is pathing or armed.
 
 `pp offline cancel` cancels your staged offline load.

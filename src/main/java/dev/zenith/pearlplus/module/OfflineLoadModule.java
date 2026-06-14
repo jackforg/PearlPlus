@@ -14,13 +14,22 @@ import com.zenith.util.ChatUtil;
 import dev.zenith.pearlplus.PearlPlusConfig;
 import dev.zenith.pearlplus.event.ImmediatePlayerInfoAddEvent;
 import dev.zenith.pearlplus.feature.offlineload.OfflineLoadPlayerInfoUpdateHandler;
+import net.dv8tion.jda.api.EmbedBuilder;
+import net.dv8tion.jda.api.entities.MessageEmbed;
+import net.dv8tion.jda.api.entities.channel.middleman.MessageChannel;
+import net.dv8tion.jda.api.events.interaction.component.ButtonInteractionEvent;
 import net.dv8tion.jda.api.events.message.MessageReceivedEvent;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
+import net.dv8tion.jda.api.components.actionrow.ActionRow;
+import net.dv8tion.jda.api.components.buttons.Button;
 import org.geysermc.mcprotocollib.protocol.data.ProtocolState;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundPlayerInfoUpdatePacket;
 
 import java.security.SecureRandom;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -29,6 +38,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 import static com.github.rfresh2.EventConsumer.of;
 import static com.zenith.Globals.BARITONE;
@@ -39,6 +49,8 @@ import static dev.zenith.pearlplus.PearlPlusPlugin.PLUGIN_CONFIG;
 
 public class OfflineLoadModule extends Module {
     private static final int READY_DISTANCE_BLOCKS = 6;
+    private static final String CONTROLS_CUSTOM_ID_PREFIX = "ppc:1:";
+    private static final int MAX_CONTROLS_LOAD_BUTTONS = 20;
     private static final char[] LINK_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".toCharArray();
 
     private final PearlManager pearlManager = new PearlManager(this);
@@ -49,6 +61,11 @@ public class OfflineLoadModule extends Module {
         @Override
         public void onMessageReceived(MessageReceivedEvent event) {
             onDedicatedDiscordMessage(event);
+        }
+
+        @Override
+        public void onButtonInteraction(ButtonInteractionEvent event) {
+            onControlsButton(event);
         }
     };
 
@@ -282,9 +299,10 @@ public class OfflineLoadModule extends Module {
 
         switch (command.kind) {
             case DISCORD_LINK -> handleDiscordLink(event);
-            case OFFLINE_LOAD -> handleOfflineLoad(event, command.arg1(), command.arg2());
-            case OFFLINE_CANCEL -> handleOfflineCancel(event);
-            case OFFLINE_STATUS -> handleOfflineStatus(event);
+            case OFFLINE_LOAD -> handleOfflineLoad(requestFor(event), command.arg1(), command.arg2());
+            case OFFLINE_CANCEL -> handleOfflineCancel(requestFor(event));
+            case OFFLINE_STATUS -> handleOfflineStatus(requestFor(event));
+            case CONTROLS -> handleDiscordControls(event);
         }
         return true;
     }
@@ -302,7 +320,7 @@ public class OfflineLoadModule extends Module {
     }
 
     private synchronized void ensureDedicatedDiscordListenerRegistration() {
-        if (!isDedicatedDiscordChannelConfigured()) {
+        if (!PLUGIN_CONFIG.offlineLoad.listenInMainChannel && !isDedicatedDiscordChannelConfigured()) {
             unregisterDedicatedDiscordListener();
             return;
         }
@@ -313,7 +331,7 @@ public class OfflineLoadModule extends Module {
 
         DISCORD.jda().addEventListener(dedicatedDiscordListener);
         dedicatedDiscordListenerRegistered = true;
-        LOG.info("Registered PearlPlus dedicated Discord listener for channel {}", PLUGIN_CONFIG.offlineLoad.dedicatedDiscordChannelId);
+        LOG.info("Registered PearlPlus Discord listener for offline commands and controls");
     }
 
     private synchronized void unregisterDedicatedDiscordListener() {
@@ -345,6 +363,220 @@ public class OfflineLoadModule extends Module {
 
         return event.getMember() != null
                 && event.getMember().getRoles().stream().anyMatch(role -> requiredRoleId.equals(role.getId()));
+    }
+
+    private void onControlsButton(ButtonInteractionEvent event) {
+        ControlsAction action = parseControlsAction(event.getComponentId());
+        if (action == null) {
+            return;
+        }
+
+        if (!action.ownerDiscordUserId().equals(event.getUser().getId())) {
+            event.reply("These PearlPlus controls belong to another Discord user.")
+                    .setEphemeral(true)
+                    .queue();
+            return;
+        }
+
+        if ("refresh".equals(action.action())) {
+            ControlsView view = buildControlsView(requestFor(event, ignored -> { }));
+            event.editMessageEmbeds(view.embed())
+                    .setComponents(view.rows())
+                    .queue();
+            return;
+        }
+
+        event.deferReply(true).queue(hook -> {
+            DiscordRequest request = requestFor(event, message -> hook.editOriginal(message).queue());
+            switch (action.action()) {
+                case "status" -> handleOfflineStatus(request);
+                case "cancel" -> handleOfflineCancel(request);
+                case "load" -> handleControlsLoad(request, action);
+                default -> hook.editOriginal("That PearlPlus control is no longer supported.").queue();
+            }
+        });
+    }
+
+    private void handleDiscordControls(MessageReceivedEvent event) {
+        ControlsView view = buildControlsView(requestFor(event));
+        event.getMessage().replyEmbeds(view.embed())
+                .addComponents(view.rows())
+                .queue();
+    }
+
+    private void handleControlsLoad(DiscordRequest request, ControlsAction action) {
+        UUID playerUuid = parseCompactUuid(action.playerUuid());
+        String pearlId = decodeControlsValue(action.pearlId());
+        if (playerUuid == null || pearlId == null) {
+            request.reply("That PearlPlus load button is invalid. Use Refresh to rebuild the panel.");
+            return;
+        }
+
+        PearlPlusConfig.DiscordBinding binding = findCandidateBindings(request).stream()
+                .filter(candidate -> playerUuid.equals(candidate.playerUuid))
+                .findFirst()
+                .orElse(null);
+        if (binding == null) {
+            request.reply("That Minecraft account is no longer linked to you. Use Refresh to rebuild the panel.");
+            return;
+        }
+
+        handleOfflineLoad(request, binding.playerName, pearlId);
+    }
+
+    private ControlsView buildControlsView(DiscordRequest request) {
+        List<PearlPlusConfig.DiscordBinding> bindings = findCandidateBindings(request).stream()
+                .sorted(Comparator.comparing(binding -> binding.playerName, String.CASE_INSENSITIVE_ORDER))
+                .toList();
+        List<Button> loadButtons = new ArrayList<>();
+        List<String> accountLines = new ArrayList<>();
+
+        for (PearlPlusConfig.DiscordBinding binding : bindings) {
+            PearlPlusConfig.PlayerPearls playerPearls = PLUGIN_CONFIG.players.get(binding.playerUuid);
+            if (playerPearls == null || playerPearls.pearls == null || playerPearls.pearls.isEmpty()) {
+                accountLines.add("- **" + binding.playerName + "**: no stored pearls");
+                continue;
+            }
+
+            String defaultPearlId = pearlManager.defaultPearlId(binding.playerUuid);
+            List<String> pearlIds = playerPearls.pearls.keySet().stream()
+                    .sorted(String.CASE_INSENSITIVE_ORDER)
+                    .toList();
+            accountLines.add("- **" + binding.playerName + "**: " + pearlIds.stream()
+                    .map(pearlId -> pearlId.equalsIgnoreCase(defaultPearlId)
+                            ? "`" + pearlId + "` (default)"
+                            : "`" + pearlId + "`")
+                    .reduce((left, right) -> left + ", " + right)
+                    .orElse("no stored pearls"));
+
+            for (String pearlId : pearlIds) {
+                if (loadButtons.size() >= MAX_CONTROLS_LOAD_BUTTONS) {
+                    break;
+                }
+                loadButtons.add(Button.primary(
+                        controlsCustomId(request.userId(), "load", binding.playerUuid, pearlId),
+                        controlsButtonLabel(binding.playerName, pearlId, defaultPearlId)
+                ));
+            }
+        }
+
+        String linkedAccounts = accountLines.isEmpty()
+                ? "No linked accounts. Use `pp discord link` or ask an admin to add a trusted binding."
+                : String.join("\n", accountLines);
+        if (loadButtons.size() >= MAX_CONTROLS_LOAD_BUTTONS) {
+            linkedAccounts += "\nOnly the first " + MAX_CONTROLS_LOAD_BUTTONS + " pearl buttons are shown.";
+        }
+
+        MessageEmbed embed = new EmbedBuilder()
+                .setTitle("PearlPlus Controls")
+                .setDescription("Buttons are locked to <@" + request.userId() + ">. Tap a load button to stage an offline pearl load.")
+                .addField("Current Status", controlsStatusText(), false)
+                .addField("Linked Accounts", linkedAccounts, false)
+                .setFooter("Use Refresh if your pearls change or after the bot restarts.")
+                .build();
+
+        List<ActionRow> rows = new ArrayList<>();
+        for (int index = 0; index < loadButtons.size(); index += 5) {
+            rows.add(ActionRow.of(loadButtons.subList(index, Math.min(index + 5, loadButtons.size()))));
+        }
+        rows.add(ActionRow.of(
+                Button.secondary(controlsCustomId(request.userId(), "refresh", null, null), "Refresh"),
+                Button.secondary(controlsCustomId(request.userId(), "status", null, null), "Status"),
+                Button.danger(controlsCustomId(request.userId(), "cancel", null, null), "Cancel")
+        ));
+
+        return new ControlsView(embed, rows);
+    }
+
+    private String controlsStatusText() {
+        StagedOfflineLoad request;
+        synchronized (this) {
+            request = activeRequest;
+        }
+        if (request == null) {
+            return "No offline load is active.";
+        }
+        if (!request.armed) {
+            return "Pathing for **" + request.playerName + "** / `" + request.pearl.pearlId + "`.";
+        }
+        long secondsRemaining = Math.max(0L, (request.expiresAt - System.currentTimeMillis() + 999L) / 1000L);
+        return "Armed for **" + request.playerName + "** / `" + request.pearl.pearlId + "` for another " + secondsRemaining + "s.";
+    }
+
+    private String controlsButtonLabel(String playerName, String pearlId, String defaultPearlId) {
+        String label = playerName;
+        if (defaultPearlId == null || !pearlId.equalsIgnoreCase(defaultPearlId)) {
+            label += " " + pearlId;
+        }
+        return label.length() <= 80 ? label : label.substring(0, 80);
+    }
+
+    private String controlsCustomId(String ownerDiscordUserId, String action, UUID playerUuid, String pearlId) {
+        String compactUuid = playerUuid == null ? "-" : playerUuid.toString().replace("-", "");
+        String encodedPearlId = pearlId == null ? "-" : encodeControlsValue(pearlId);
+        return CONTROLS_CUSTOM_ID_PREFIX + ownerDiscordUserId + ":" + action + ":" + compactUuid + ":" + encodedPearlId;
+    }
+
+    private ControlsAction parseControlsAction(String customId) {
+        if (customId == null || !customId.startsWith(CONTROLS_CUSTOM_ID_PREFIX)) {
+            return null;
+        }
+        String[] parts = customId.split(":", 6);
+        if (parts.length != 6 || !"ppc".equals(parts[0]) || !"1".equals(parts[1])) {
+            return null;
+        }
+        return new ControlsAction(parts[2], parts[3], parts[4], parts[5]);
+    }
+
+    private String encodeControlsValue(String value) {
+        return Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String decodeControlsValue(String value) {
+        if (value == null || "-".equals(value)) {
+            return null;
+        }
+        try {
+            return new String(Base64.getUrlDecoder().decode(value), StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
+    }
+
+    private UUID parseCompactUuid(String value) {
+        if (value == null || value.length() != 32) {
+            return null;
+        }
+        try {
+            return UUID.fromString(value.substring(0, 8) + "-"
+                    + value.substring(8, 12) + "-"
+                    + value.substring(12, 16) + "-"
+                    + value.substring(16, 20) + "-"
+                    + value.substring(20));
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
+    }
+
+    private DiscordRequest requestFor(MessageReceivedEvent event) {
+        return new DiscordRequest(
+                event.getAuthor().getId(),
+                event.getAuthor().getName(),
+                event.getMember() != null ? event.getMember().getEffectiveName() : event.getAuthor().getName(),
+                event.getChannel(),
+                message -> replyToDiscord(event, message)
+        );
+    }
+
+    private DiscordRequest requestFor(ButtonInteractionEvent event, Consumer<String> responder) {
+        return new DiscordRequest(
+                event.getUser().getId(),
+                event.getUser().getName(),
+                event.getMember() != null ? event.getMember().getEffectiveName() : event.getUser().getName(),
+                event.getChannel(),
+                responder
+        );
     }
 
     private synchronized String completeBinding(UUID playerUuid, String playerName, String rawCode) {
@@ -395,37 +627,37 @@ public class OfflineLoadModule extends Module {
         );
     }
 
-    private void handleOfflineLoad(MessageReceivedEvent event, String arg1, String arg2) {
-        List<PearlPlusConfig.DiscordBinding> candidateBindings = findCandidateBindings(event);
+    private void handleOfflineLoad(DiscordRequest request, String arg1, String arg2) {
+        List<PearlPlusConfig.DiscordBinding> candidateBindings = findCandidateBindings(request);
 
         if (candidateBindings.isEmpty()) {
-            replyToDiscord(event, "Your Discord account is not linked yet. Run `pp discord link`, then whisper `bind CODE` to the bot in game.");
+            request.reply("Your Discord account is not linked yet. Run `pp discord link`, then whisper `bind CODE` to the bot in game.");
             return;
         }
 
         synchronized (this) {
             if (activeRequest != null) {
-                replyToDiscord(event, "The bot is already reserved for " + activeRequestSummary() + ".");
+                request.reply("The bot is already reserved for " + activeRequestSummary() + ".");
                 return;
             }
         }
 
         String blocker = pearlManager.validateCanLoad();
         if (blocker != null) {
-            replyToDiscord(event, blocker);
+            request.reply(blocker);
             return;
         }
 
         LoadSelection selection = selectOfflineLoad(candidateBindings, arg1, arg2);
         if (selection.errorMessage() != null) {
-            replyToDiscord(event, selection.errorMessage());
+            request.reply(selection.errorMessage());
             return;
         }
 
         PearlPlusConfig.DiscordBinding binding = selection.binding();
         var playerEntry = PLUGIN_CONFIG.players.get(binding.playerUuid);
         if (playerEntry == null || playerEntry.pearls == null || playerEntry.pearls.isEmpty()) {
-            replyToDiscord(event, "No pearls are stored for " + binding.playerName + ".");
+            request.reply("No pearls are stored for " + binding.playerName + ".");
             return;
         }
 
@@ -435,14 +667,14 @@ public class OfflineLoadModule extends Module {
         }
 
         if (pearlId == null || !playerEntry.pearls.containsKey(pearlId)) {
-            replyToDiscord(event, "I couldn't find a usable pearl for " + binding.playerName + ".");
+            request.reply("I couldn't find a usable pearl for " + binding.playerName + ".");
             return;
         }
 
         PearlPlusConfig.StoredPearl pearl = copyPearl(playerEntry.pearls.get(pearlId));
         PearlManager.PreparedLoadTarget preparedLoadTarget = pearlManager.prepareLoadTarget(pearl).orElse(null);
         if (preparedLoadTarget == null) {
-            replyToDiscord(event, "I couldn't prepare a click target for that pearl right now.");
+            request.reply("I couldn't prepare a click target for that pearl right now.");
             return;
         }
 
@@ -450,14 +682,14 @@ public class OfflineLoadModule extends Module {
                 ? CACHE.getPlayerCache().getThePlayer().blockPos()
                 : null;
         if (startPos == null) {
-            replyToDiscord(event, "I can't tell where the bot is standing right now.");
+            request.reply("I can't tell where the bot is standing right now.");
             return;
         }
 
-        StagedOfflineLoad request = new StagedOfflineLoad(
-                event,
-                event.getAuthor().getId(),
-                binding.discordDisplayName != null ? binding.discordDisplayName : event.getAuthor().getName(),
+        StagedOfflineLoad stagedRequest = new StagedOfflineLoad(
+                request.channel(),
+                request.userId(),
+                binding.discordDisplayName != null ? binding.discordDisplayName : request.authorName(),
                 binding.playerUuid,
                 binding.playerName,
                 pearl,
@@ -466,57 +698,61 @@ public class OfflineLoadModule extends Module {
         );
 
         synchronized (this) {
-            activeRequest = request;
+            if (activeRequest != null) {
+                request.reply("The bot is already reserved for " + activeRequestSummary() + ".");
+                return;
+            }
+            activeRequest = stagedRequest;
         }
 
-        replyToDiscord(event, "Pathing to pearl `" + pearl.pearlId + "`. Your 2 minute login window starts once I'm in position.");
+        request.reply("Pathing to pearl `" + pearl.pearlId + "`. Your 2 minute login window starts once I'm in position.");
         discordAndIngameNotification(Embed.builder()
                 .title("Offline Load Requested")
                 .addField("Player", binding.playerName)
                 .addField("Pearl", pearl.pearlId)
                 .primaryColor());
 
-        pathOfflineRequest(request);
+        pathOfflineRequest(stagedRequest);
     }
 
-    private void handleOfflineCancel(MessageReceivedEvent event) {
+    private void handleOfflineCancel(DiscordRequest discordRequest) {
         StagedOfflineLoad request;
         synchronized (this) {
             request = activeRequest;
         }
 
         if (request == null) {
-            replyToDiscord(event, "There isn't an active offline load request right now.");
+            discordRequest.reply("There isn't an active offline load request right now.");
             return;
         }
 
-        if (!request.discordUserId.equals(event.getAuthor().getId())) {
-            replyToDiscord(event, "Only the Discord user who created the offline load can cancel it.");
+        if (!request.discordUserId.equals(discordRequest.userId())) {
+            discordRequest.reply("Only the Discord user who created the offline load can cancel it.");
             return;
         }
 
         clearActiveRequest(request, "Offline load cancelled.", true);
-        replyToDiscord(event, "Cancelled the staged offline load.");
+        discordRequest.reply("Cancelled the staged offline load.");
     }
 
-    private void handleOfflineStatus(MessageReceivedEvent event) {
+    private void handleOfflineStatus(DiscordRequest discordRequest) {
         StagedOfflineLoad request;
         synchronized (this) {
             request = activeRequest;
         }
 
         if (request == null) {
-            replyToDiscord(event, "No offline load is active right now.");
+            discordRequest.reply("No offline load is active right now.");
             return;
         }
 
         if (!request.armed) {
-            replyToDiscord(event, "Offline load is still pathing for " + request.playerName + " / `" + request.pearl.pearlId + "`.");
+            discordRequest.reply("Offline load is still pathing for " + request.playerName + " / `" + request.pearl.pearlId + "`.");
             return;
         }
 
         long secondsRemaining = Math.max(0L, (request.expiresAt - System.currentTimeMillis() + 999L) / 1000L);
-        replyToDiscord(event, "Offline load is armed for " + request.playerName + " / `" + request.pearl.pearlId + "` for another " + secondsRemaining + "s.");
+        discordRequest.reply("Offline load is armed for " + request.playerName + " / `" + request.pearl.pearlId + "` for another " + secondsRemaining + "s.");
     }
 
     private void onStagePathComplete(StagedOfflineLoad request) {
@@ -531,7 +767,7 @@ public class OfflineLoadModule extends Module {
                 return;
             }
             clearActiveRequest(request, "I couldn't get into position for the offline load.", true);
-            sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " I couldn't get into position for `" + request.pearl.pearlId + "`.");
+            sendChannelMessage(request.sourceChannel, mention(request.discordUserId) + " I couldn't get into position for `" + request.pearl.pearlId + "`.");
             return;
         }
 
@@ -542,7 +778,7 @@ public class OfflineLoadModule extends Module {
                 return;
             }
             clearActiveRequest(request, reason, true);
-            sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " " + reason);
+            sendChannelMessage(request.sourceChannel, mention(request.discordUserId) + " " + reason);
             return;
         }
 
@@ -564,7 +800,7 @@ public class OfflineLoadModule extends Module {
         }
 
         sendChannelMessage(
-                request.sourceEvent,
+                request.sourceChannel,
                 mention(request.discordUserId) + " pearl `" + request.pearl.pearlId + "` is armed. You have "
                         + PLUGIN_CONFIG.offlineLoad.readyWindowSeconds + " seconds to join."
         );
@@ -577,7 +813,7 @@ public class OfflineLoadModule extends Module {
 
     private void expireActiveRequest(StagedOfflineLoad request) {
         clearActiveRequest(request, "Offline load window expired.", true);
-        sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " the offline load window for `" + request.pearl.pearlId + "` expired.");
+        sendChannelMessage(request.sourceChannel, mention(request.discordUserId) + " the offline load window for `" + request.pearl.pearlId + "` expired.");
     }
 
     private void triggerActiveRequest(StagedOfflineLoad request, String triggerSource, long detectedOnlineAt) {
@@ -597,13 +833,13 @@ public class OfflineLoadModule extends Module {
 
         String blocker = pearlManager.validateCanLoad();
         if (blocker != null) {
-            sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " I couldn't activate the pearl: " + blocker);
+            sendChannelMessage(request.sourceChannel, mention(request.discordUserId) + " I couldn't activate the pearl: " + blocker);
             returnToStartPosition(request.startPos);
             return;
         }
 
         if (!pearlManager.isNearPreparedLoadTarget(request.preparedLoadTarget, READY_DISTANCE_BLOCKS)) {
-            sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " I drifted away from the chamber, so I'm falling back to a normal load.");
+            sendChannelMessage(request.sourceChannel, mention(request.discordUserId) + " I drifted away from the chamber, so I'm falling back to a normal load.");
             pearlManager.loadPearl(request.pearl, request.playerName);
             return;
         }
@@ -611,7 +847,7 @@ public class OfflineLoadModule extends Module {
         if (!pearlManager.isClickTargetReachableFromCurrentPosition(request.preparedLoadTarget)) {
             String reason = pearlManager.unreachableClickTargetMessage(request.preparedLoadTarget, request.pearl);
             LOG.warn(reason);
-            sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " " + reason);
+            sendChannelMessage(request.sourceChannel, mention(request.discordUserId) + " " + reason);
             returnToStartPosition(request.startPos);
             return;
         }
@@ -633,7 +869,7 @@ public class OfflineLoadModule extends Module {
                 onlineDetectToTriggerStartMs >= 0L ? ", " + onlineDetectToTriggerStartMs + "ms detect-to-trigger" : "",
                 armedToTriggerStartMs >= 0L ? ", " + armedToTriggerStartMs + "ms armed-to-trigger" : "");
         pearlManager.triggerPreparedLoad(request.preparedLoadTarget, request.pearl, request.playerName, request.startPos);
-        sendChannelMessage(request.sourceEvent,
+        sendChannelMessage(request.sourceChannel,
                 mention(request.discordUserId) + " detected `" + request.playerName + "` online. Activating `" + request.pearl.pearlId + "` now.");
     }
 
@@ -641,7 +877,7 @@ public class OfflineLoadModule extends Module {
         PearlManager.PreparedLoadTarget preparedLoadTarget = request.preparedLoadTarget;
         if (preparedLoadTarget == null) {
             clearActiveRequest(request, "I couldn't prepare a click target for the offline load.", true);
-            sendChannelMessage(request.sourceEvent, mention(request.discordUserId) + " I couldn't prepare a click target for `" + request.pearl.pearlId + "`.");
+            sendChannelMessage(request.sourceChannel, mention(request.discordUserId) + " I couldn't prepare a click target for `" + request.pearl.pearlId + "`.");
             return;
         }
 
@@ -722,8 +958,8 @@ public class OfflineLoadModule extends Module {
         event.getMessage().reply(message).queue();
     }
 
-    private void sendChannelMessage(MessageReceivedEvent event, String message) {
-        event.getChannel().sendMessage(message).queue();
+    private void sendChannelMessage(MessageChannel channel, String message) {
+        channel.sendMessage(message).queue();
     }
 
     private ParsedCommand parseCommand(String rawMessage) {
@@ -746,6 +982,9 @@ public class OfflineLoadModule extends Module {
         }
 
         String root = normalizeCommandToken(parts[index]);
+        if ("controls".equals(root)) {
+            return new ParsedCommand(CommandKind.CONTROLS, null, null);
+        }
         if ("discord".equals(root) && index + 1 < parts.length && "link".equalsIgnoreCase(parts[index + 1])) {
             return new ParsedCommand(CommandKind.DISCORD_LINK, null, null);
         }
@@ -759,6 +998,7 @@ public class OfflineLoadModule extends Module {
 
         String action = normalizeCommandToken(parts[index + 1]);
         return switch (action) {
+            case "controls" -> new ParsedCommand(CommandKind.CONTROLS, null, null);
             case "load" -> new ParsedCommand(
                     CommandKind.OFFLINE_LOAD,
                     index + 2 < parts.length ? parts[index + 2] : null,
@@ -809,22 +1049,22 @@ public class OfflineLoadModule extends Module {
         return "<@" + discordUserId + ">";
     }
 
-    private List<PearlPlusConfig.DiscordBinding> findCandidateBindings(MessageReceivedEvent event) {
+    private List<PearlPlusConfig.DiscordBinding> findCandidateBindings(DiscordRequest request) {
         Map<String, PearlPlusConfig.DiscordBinding> bindings = new LinkedHashMap<>();
 
         synchronized (this) {
-            PearlPlusConfig.DiscordBinding directBinding = PLUGIN_CONFIG.offlineLoad.discordBindings.get(event.getAuthor().getId());
+            PearlPlusConfig.DiscordBinding directBinding = PLUGIN_CONFIG.offlineLoad.discordBindings.get(request.userId());
             if (isUsableBinding(directBinding)) {
                 bindings.put(bindingKey(directBinding), directBinding);
             }
         }
 
-        String discordUserId = event.getAuthor().getId();
-        String displayName = discordDisplayName(event);
+        String discordUserId = request.userId();
+        String displayName = request.displayName();
 
         synchronized (this) {
             for (PearlPlusConfig.TrustedDiscordBinding trustedBinding : PLUGIN_CONFIG.offlineLoad.trustedDiscordBindings.values()) {
-                if (!matchesTrustedBinding(event, trustedBinding)) {
+                if (!matchesTrustedBinding(request, trustedBinding)) {
                     continue;
                 }
 
@@ -858,14 +1098,14 @@ public class OfflineLoadModule extends Module {
         return new ArrayList<>(bindings.values());
     }
 
-    private boolean matchesTrustedBinding(MessageReceivedEvent event, PearlPlusConfig.TrustedDiscordBinding trustedBinding) {
+    private boolean matchesTrustedBinding(DiscordRequest request, PearlPlusConfig.TrustedDiscordBinding trustedBinding) {
         if (trustedBinding == null || trustedBinding.playerName == null || trustedBinding.playerName.isBlank()) {
             return false;
         }
 
-        String discordUserId = event.getAuthor().getId();
-        String authorName = event.getAuthor().getName();
-        String displayName = discordDisplayName(event);
+        String discordUserId = request.userId();
+        String authorName = request.authorName();
+        String displayName = request.displayName();
 
         if (trustedBinding.discordUserId != null && !trustedBinding.discordUserId.isBlank()
                 && trustedBinding.discordUserId.equals(discordUserId)) {
@@ -999,10 +1239,6 @@ public class OfflineLoadModule extends Module {
         return playerPearls != null ? playerPearls.playerName : null;
     }
 
-    private String discordDisplayName(MessageReceivedEvent event) {
-        return event.getMember() != null ? event.getMember().getEffectiveName() : event.getAuthor().getName();
-    }
-
     private boolean looksLikeDiscordUserId(String value) {
         if (value == null || value.isBlank()) {
             return false;
@@ -1028,7 +1264,8 @@ public class OfflineLoadModule extends Module {
         DISCORD_LINK,
         OFFLINE_LOAD,
         OFFLINE_CANCEL,
-        OFFLINE_STATUS
+        OFFLINE_STATUS,
+        CONTROLS
     }
 
     private record ParsedCommand(CommandKind kind, String arg1, String arg2) {
@@ -1040,8 +1277,31 @@ public class OfflineLoadModule extends Module {
     private record PendingLink(String code, String discordUserId, String discordDisplayName, long expiresAt) {
     }
 
+    private record DiscordRequest(
+            String userId,
+            String authorName,
+            String displayName,
+            MessageChannel channel,
+            Consumer<String> responder
+    ) {
+        private void reply(String message) {
+            responder.accept(message);
+        }
+    }
+
+    private record ControlsAction(
+            String ownerDiscordUserId,
+            String action,
+            String playerUuid,
+            String pearlId
+    ) {
+    }
+
+    private record ControlsView(MessageEmbed embed, List<ActionRow> rows) {
+    }
+
     private static final class StagedOfflineLoad {
-        private final MessageReceivedEvent sourceEvent;
+        private final MessageChannel sourceChannel;
         private final String discordUserId;
         private final String discordDisplayName;
         private final UUID playerUuid;
@@ -1057,7 +1317,7 @@ public class OfflineLoadModule extends Module {
         private long expiresAt;
 
         private StagedOfflineLoad(
-                MessageReceivedEvent sourceEvent,
+                MessageChannel sourceChannel,
                 String discordUserId,
                 String discordDisplayName,
                 UUID playerUuid,
@@ -1066,7 +1326,7 @@ public class OfflineLoadModule extends Module {
                 PearlManager.PreparedLoadTarget preparedLoadTarget,
                 BlockPos startPos
         ) {
-            this.sourceEvent = sourceEvent;
+            this.sourceChannel = sourceChannel;
             this.discordUserId = discordUserId;
             this.discordDisplayName = discordDisplayName;
             this.playerUuid = playerUuid;
